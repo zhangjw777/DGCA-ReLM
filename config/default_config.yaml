@@ -1,0 +1,63 @@
+# DGCA-ReLM 默认配置文件
+# 支持消融实验开关控制
+
+# ============ 模型结构开关（消融实验） ============
+# 是否使用检测分支
+use_detector: true
+# 是否使用候选注意力头
+use_candidate_head: true
+# 是否使用门控融合
+use_gated_fusion: true
+
+# ============ 候选集相关 ============
+# 候选集大小K
+candidate_size: 16
+# 混淆集文件路径，会优先使用混淆集目录的，这个作为备选
+confusion_file: "confusion/confusion_dict.json" 
+# 是否在候选集中包含原字符（允许"不改"）
+include_original_char: true
+# 是否使用语言模型top-k候选补充混淆集
+use_lm_candidates: false
+lm_candidate_topk: 5
+
+# ============ 检测分支相关 ============
+# 检测分支的dropout
+detector_dropout: 0.1
+# 检测损失的权重 λ_det
+detector_loss_weight: 1.0
+# 检测分支正样本权重（β，鼓励少漏检提升召回）
+detector_pos_weight: 3.0
+
+# ============ 候选头相关 ============
+# 候选头的dropout
+candidate_dropout: 0.1
+
+# ============ 门控融合相关 ============
+# 门控初始偏置
+gate_init_bias: 0.0
+
+# ============ 损失函数相关 ============
+# 辅助MLM损失权重 λ_aux
+aux_mlm_loss_weight: 1.0
+# 候选排序损失权重 λ_rank
+rank_loss_weight: 0.5
+# 候选排序损失的margin
+rank_margin: 0.5
+# 错误位加权 γ（错误位权重 = 1 + γ）
+error_position_weight: 2.0
+
+# ============ 推理相关 ============
+# 检测阈值
+detect_threshold: 0.5
+# 门控阈值
+gate_threshold: 0.3
+# 是否使用两次迭代修正
+use_iterative_refinement: false
+
+# ============ 数据增强相关 ============
+# 是否使用上下文错误增强
+use_contextual_error_aug: false
+# 是否使用多错共存增强
+use_multi_typo_aug: false
+multi_typo_min: 2
+multi_typo_max: 3
