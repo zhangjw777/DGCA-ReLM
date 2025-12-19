@@ -171,6 +171,7 @@ def main():
     parser.add_argument("--no_cuda", action="store_true")
     parser.add_argument("--fp16", action="store_true", help="是否使用混合精度")
     parser.add_argument("--local_rank", type=int, default=-1, help="DDP local rank")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader的工作进程数")
     
     # ============ ReLM相关 ============
     parser.add_argument("--mft", action="store_true", help="masked-fine-tuning")
@@ -279,7 +280,10 @@ def main():
         train_dataloader = DataLoader(
             train_dataset,
             sampler=train_sampler,
-            batch_size=per_device_batch_size
+            batch_size=per_device_batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            persistent_workers=True if args.num_workers > 0 else False
         )
         
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -310,7 +314,9 @@ def main():
         eval_dataloader = DataLoader(
             eval_dataset,
             sampler=eval_sampler,
-            batch_size=args.eval_batch_size
+            batch_size=args.eval_batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True
         )
     
     # ============ 创建模型 ============
@@ -632,7 +638,9 @@ def main():
         test_dataloader = DataLoader(
             test_dataset,
             sampler=test_sampler,
-            batch_size=args.eval_batch_size
+            batch_size=args.eval_batch_size,
+            num_workers=args.num_workers,
+            pin_memory=True
         )
         
         # 如果没有训练，需要重新加载模型
