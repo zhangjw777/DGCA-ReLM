@@ -159,16 +159,62 @@ def preprocess_to_pt(
     confusion_set,
     max_seq_length: int,
     prompt_length: int,
-    num_workers: int = None
+    num_workers: int = None,
+    batch_size: int = None
 ) -> dict:
-    """将src/trg对预处理为pt格式"""
+    """将src/trg对预处理为pt格式
+    
+    Args:
+        batch_size: 分批处理大小，None表示一次性处理所有数据。
+                    建议大数据集设置为10000-50000以避免OOM
+    """
     from utils.dgca_data_processor import convert_examples_to_prompts, generate_error_labels
     
     if num_workers is None:
         num_workers = max(1, cpu_count() // 2)
     
+    # 如果未指定batch_size或数据量较小，一次性处理
+    if batch_size is None or len(pairs) <= batch_size:
+        return _process_batch_to_dict(
+            pairs, tokenizer, confusion_set, max_seq_length, prompt_length
+        )
+    
+    # 大数据集分批处理
+    print(f"数据量较大({len(pairs)}样本)，使用分批处理(batch_size={batch_size})")
+    all_batches = []
+    for i in tqdm(range(0, len(pairs), batch_size), desc="分批预处理"):
+        batch_pairs = pairs[i:i+batch_size]
+        batch_dict = _process_batch_to_dict(
+            batch_pairs, tokenizer, confusion_set, max_seq_length, prompt_length
+        )
+        all_batches.append(batch_dict)
+    
+    # 合并所有批次
+    print("合并所有批次...")
+    merged = {
+        'input_ids': torch.cat([b['input_ids'] for b in all_batches], dim=0),
+        'attention_mask': torch.cat([b['attention_mask'] for b in all_batches], dim=0),
+        'labels': torch.cat([b['labels'] for b in all_batches], dim=0),
+        'trg_ref_ids': torch.cat([b['trg_ref_ids'] for b in all_batches], dim=0),
+        'block_flag': torch.cat([b['block_flag'] for b in all_batches], dim=0),
+        'error_labels': torch.cat([b['error_labels'] for b in all_batches], dim=0),
+        'candidate_ids': torch.cat([b['candidate_ids'] for b in all_batches], dim=0)
+    }
+    return merged
+
+
+def _process_batch_to_dict(
+    pairs: List[Tuple[List[str], List[str]]],
+    tokenizer,
+    confusion_set,
+    max_seq_length: int,
+    prompt_length: int
+) -> dict:
+    """处理一批数据并返回dict格式"""
+    from utils.dgca_data_processor import convert_examples_to_prompts, generate_error_labels
+    
     results = []
-    for src, trg in tqdm(pairs, desc="预处理"):
+    for src, trg in pairs:
         try:
             # 截断
             half_len = max_seq_length // 2 - prompt_length
@@ -256,6 +302,8 @@ def main():
                         help="train,dev,test划分比例")
     parser.add_argument("--no_error_ratio", type=float, default=0.2,
                         help="无错样本比例，默认0.2（20%不造错，让模型学会不改）")
+    parser.add_argument("--batch_size", type=int, default=50000,
+                        help="分批处理大小，避免OOM。默认50000，可根据内存调整")
     
     args = parser.parse_args()
     
@@ -309,7 +357,8 @@ def main():
         print(f"\n预处理 {name}...")
         pt_data = preprocess_to_pt(
             data_pairs, tokenizer, confusion_set,
-            args.max_seq_length, args.prompt_length, args.num_workers
+            args.max_seq_length, args.prompt_length, args.num_workers,
+            batch_size=args.batch_size
         )
         output_path = os.path.join(args.output_dir, f"{name}.pt")
         torch.save(pt_data, output_path)
