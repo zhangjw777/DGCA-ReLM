@@ -655,28 +655,61 @@ def preprocess_large_dataset_parallel(
 
 
 class PreprocessedDataset(Dataset):
-    """加载预处理好的数据集"""
+    """
+    加载预处理好的数据集
     
-    def __init__(self, preprocessed_file: str):
+    优化：
+    1. 将数据转为连续的内存布局，加速索引
+    2. 支持返回元组模式，减少字典构造开销
+    3. 预先将数据移到共享内存（可选，用于多worker）
+    """
+    
+    def __init__(self, preprocessed_file: str, use_shared_memory: bool = True):
         """
         Args:
             preprocessed_file: 预处理好的.pt文件路径
+            use_shared_memory: 是否将数据放到共享内存（推荐True，支持多worker高效访问）
         """
         logger.info(f"Loading preprocessed data from {preprocessed_file}")
-        self.data = torch.load(preprocessed_file)
-        self.size = self.data['input_ids'].shape[0]
-        logger.info(f"Loaded {self.size} samples")
+        raw_data = torch.load(preprocessed_file)
+        
+        # 将数据转为连续内存布局，加速索引
+        # 并可选地移到共享内存，避免多worker时的数据复制
+        self.input_ids = raw_data['input_ids'].contiguous()
+        self.attention_mask = raw_data['attention_mask'].contiguous()
+        self.labels = raw_data['labels'].contiguous()
+        self.trg_ref_ids = raw_data['trg_ref_ids'].contiguous()
+        self.block_flag = raw_data['block_flag'].contiguous()
+        self.error_labels = raw_data['error_labels'].contiguous()
+        self.candidate_ids = raw_data['candidate_ids'].contiguous()
+        
+        if use_shared_memory:
+            # 移到共享内存，多worker可以直接访问而无需复制
+            self.input_ids = self.input_ids.share_memory_()
+            self.attention_mask = self.attention_mask.share_memory_()
+            self.labels = self.labels.share_memory_()
+            self.trg_ref_ids = self.trg_ref_ids.share_memory_()
+            self.block_flag = self.block_flag.share_memory_()
+            self.error_labels = self.error_labels.share_memory_()
+            self.candidate_ids = self.candidate_ids.share_memory_()
+        
+        self.size = self.input_ids.shape[0]
+        logger.info(f"Loaded {self.size} samples (shared_memory={use_shared_memory})")
+        
+        # 释放原始数据引用
+        del raw_data
     
     def __len__(self):
         return self.size
     
     def __getitem__(self, idx):
+        # 直接返回字典，Tensor切片操作非常快
         return {
-            'input_ids': self.data['input_ids'][idx],
-            'attention_mask': self.data['attention_mask'][idx],
-            'labels': self.data['labels'][idx],
-            'trg_ref_ids': self.data['trg_ref_ids'][idx],
-            'block_flag': self.data['block_flag'][idx],
-            'error_labels': self.data['error_labels'][idx],
-            'candidate_ids': self.data['candidate_ids'][idx]
+            'input_ids': self.input_ids[idx],
+            'attention_mask': self.attention_mask[idx],
+            'labels': self.labels[idx],
+            'trg_ref_ids': self.trg_ref_ids[idx],
+            'block_flag': self.block_flag[idx],
+            'error_labels': self.error_labels[idx],
+            'candidate_ids': self.candidate_ids[idx]
         }

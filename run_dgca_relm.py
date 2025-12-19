@@ -399,8 +399,14 @@ def main():
         if is_main_process(args):
             logger.info("***** Running training *****")
             logger.info(f"  Num examples = {len(train_dataset)}")
-            logger.info(f"  Batch size = {args.train_batch_size}")
-            logger.info(f"  Num steps = {args.max_train_steps}")
+            logger.info(f"  Per-device batch size = {per_device_batch_size}")
+            logger.info(f"  Num GPUs = {dist.get_world_size() if dist.is_initialized() else 1}")
+            logger.info(f"  Gradient accumulation steps = {args.gradient_accumulation_steps}")
+            total_batch = per_device_batch_size * args.gradient_accumulation_steps * (dist.get_world_size() if dist.is_initialized() else 1)
+            logger.info(f"  Total effective batch size = {total_batch}")
+            logger.info(f"  Num epochs = {args.num_train_epochs}")
+            logger.info(f"  Num update steps = {args.max_train_steps}")
+            logger.info(f"  DataLoader num_workers = {args.num_workers}")
             # 保存训练参数
             torch.save(args, os.path.join(args.output_dir, "train_args.bin"))
         
