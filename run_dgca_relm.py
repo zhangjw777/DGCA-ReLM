@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 def setup_ddp(args):
     """初始化DDP环境"""
+    # 从环境变量获取 local_rank（torchrun 会设置这个环境变量）
+    if 'LOCAL_RANK' in os.environ:
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+    
     if args.local_rank != -1:
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
@@ -373,8 +377,8 @@ def main():
         # 混合精度
         scaler = None
         if args.fp16:
-            from torch.cuda.amp import autocast, GradScaler
-            scaler = GradScaler()
+            from torch.amp import autocast, GradScaler
+            scaler = GradScaler('cuda')
     
     # ============ 训练 ============
     if args.do_train:
@@ -452,8 +456,8 @@ def main():
                 
                 # 前向传播
                 if args.fp16:
-                    from torch.cuda.amp import autocast
-                    with autocast():
+                    from torch.amp import autocast
+                    with autocast('cuda'):
                         outputs = model(
                             input_ids=src_ids,
                             attention_mask=attention_mask,
