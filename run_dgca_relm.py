@@ -155,6 +155,14 @@ def main():
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--logging_steps", type=int, default=100)
     
+    # ============ Early Stopping ============
+    parser.add_argument("--early_stopping_patience", type=int, default=None,
+                        help="Early stopping patience，连续 N 次 eval 指标不提升则停止。"
+                             "默认None表示不启用")
+    parser.add_argument("--early_stopping_metric", type=str, default="f1",
+                        choices=["f1", "f2", "precision", "recall"],
+                        help="Early stopping 监控的指标")
+    
     # ============ 硬件配置 ============
     parser.add_argument("--no_cuda", action="store_true")
     parser.add_argument("--fp16", action="store_true", help="是否使用混合精度")
@@ -389,8 +397,10 @@ def main():
         global_step = 0
         best_result = []
         wrap = False
-        
-        # 用于累积loss分项以便记录平均值
+                # Early Stopping 相关
+        best_metric = 0.0
+        patience_counter = 0
+                # 用于累积loss分项以便记录平均值
         accumulated_losses = {
             'total': 0.0,
             'correction': 0.0,
@@ -569,6 +579,22 @@ def main():
                         f.write(f"Step {global_step}: P={eval_result['precision']:.2f}, "
                                f"R={eval_result['recall']:.2f}, F1={eval_result['f1']:.2f}, "
                                f"F2={eval_result['f2']:.2f}, FPR={eval_result['fpr']:.2f}\n")
+                    
+                    # Early Stopping 判断
+                    if args.early_stopping_patience is not None:
+                        current_metric = eval_result[args.early_stopping_metric]
+                        if current_metric > best_metric:
+                            best_metric = current_metric
+                            patience_counter = 0
+                            logger.info(f"New best {args.early_stopping_metric}: {best_metric:.4f}")
+                        else:
+                            patience_counter += 1
+                            logger.info(f"Early stopping patience: {patience_counter}/{args.early_stopping_patience}")
+                            
+                            if patience_counter >= args.early_stopping_patience:
+                                logger.info(f"Early stopping triggered! Best {args.early_stopping_metric}: {best_metric:.4f}")
+                                wrap = True
+                                break
                 
                 if global_step >= args.max_train_steps:
                     wrap = True
@@ -581,16 +607,23 @@ def main():
     
     # ============ 测试 ============
     if args.do_test:
-        test_examples = processor.get_test_examples(args.data_dir, args.test_on)
-        test_features = convert_examples_to_dgca_features(
-            test_examples,
-            args.max_seq_length,
-            tokenizer,
-            confusion_set,
-            args.prompt_length,
-            anchor=anchor
-        )
-        test_dataset = create_dgca_dataset(test_features)
+        # 优先使用预处理数据
+        if args.preprocessed_test:
+            if is_main_process(args):
+                logger.info(f"Loading preprocessed test data from {args.preprocessed_test}")
+            test_dataset = PreprocessedDataset(args.preprocessed_test)
+        else:
+            test_examples = processor.get_test_examples(args.data_dir, args.test_on)
+            test_features = convert_examples_to_dgca_features(
+                test_examples,
+                args.max_seq_length,
+                tokenizer,
+                confusion_set,
+                args.prompt_length,
+                anchor=anchor
+            )
+            test_dataset = create_dgca_dataset(test_features)
+        
         test_sampler = SequentialSampler(test_dataset)
         test_dataloader = DataLoader(
             test_dataset,

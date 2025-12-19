@@ -61,3 +61,10 @@ use_contextual_error_aug: false
 use_multi_typo_aug: false
 multi_typo_min: 2
 multi_typo_max: 3
+
+# ============ Early Stopping 相关 ============
+# Early stopping patience，连续 N 次 eval 指标不提升则停止
+# 设置为 null 或不设置表示不启用 early stopping
+early_stopping_patience: 5
+# 监控的指标：f1（默认）/ f2 / precision / recall
+early_stopping_metric: "f2"
