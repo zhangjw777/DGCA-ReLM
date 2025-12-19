@@ -659,57 +659,51 @@ class PreprocessedDataset(Dataset):
     加载预处理好的数据集
     
     优化：
-    1. 将数据转为连续的内存布局，加速索引
-    2. 支持返回元组模式，减少字典构造开销
-    3. 预先将数据移到共享内存（可选，用于多worker）
+    1. 尝试使用 mmap 模式加载（PyTorch 2.1+），避免一次性读入全部数据
+    2. 对于旧版本 PyTorch，直接加载
     """
     
-    def __init__(self, preprocessed_file: str, use_shared_memory: bool = True):
+    def __init__(self, preprocessed_file: str):
         """
         Args:
             preprocessed_file: 预处理好的.pt文件路径
-            use_shared_memory: 是否将数据放到共享内存（推荐True，支持多worker高效访问）
         """
         logger.info(f"Loading preprocessed data from {preprocessed_file}")
-        raw_data = torch.load(preprocessed_file)
         
-        # 将数据转为连续内存布局，加速索引
-        # 并可选地移到共享内存，避免多worker时的数据复制
-        self.input_ids = raw_data['input_ids'].contiguous()
-        self.attention_mask = raw_data['attention_mask'].contiguous()
-        self.labels = raw_data['labels'].contiguous()
-        self.trg_ref_ids = raw_data['trg_ref_ids'].contiguous()
-        self.block_flag = raw_data['block_flag'].contiguous()
-        self.error_labels = raw_data['error_labels'].contiguous()
-        self.candidate_ids = raw_data['candidate_ids'].contiguous()
+        # 尝试使用 mmap 模式加载（PyTorch 2.1+ 支持）
+        # mmap 模式下数据按需读取，初始加载非常快
+        try:
+            raw_data = torch.load(preprocessed_file, map_location='cpu', mmap=True)
+            use_mmap = True
+        except TypeError:
+            # 旧版本 PyTorch 不支持 mmap 参数
+            raw_data = torch.load(preprocessed_file, map_location='cpu')
+            use_mmap = False
         
-        if use_shared_memory:
-            # 移到共享内存，多worker可以直接访问而无需复制
-            self.input_ids = self.input_ids.share_memory_()
-            self.attention_mask = self.attention_mask.share_memory_()
-            self.labels = self.labels.share_memory_()
-            self.trg_ref_ids = self.trg_ref_ids.share_memory_()
-            self.block_flag = self.block_flag.share_memory_()
-            self.error_labels = self.error_labels.share_memory_()
-            self.candidate_ids = self.candidate_ids.share_memory_()
+        # 直接使用加载的数据
+        self.input_ids = raw_data['input_ids']
+        self.attention_mask = raw_data['attention_mask']
+        self.labels = raw_data['labels']
+        self.trg_ref_ids = raw_data['trg_ref_ids']
+        self.block_flag = raw_data['block_flag']
+        self.error_labels = raw_data['error_labels']
+        self.candidate_ids = raw_data['candidate_ids']
         
         self.size = self.input_ids.shape[0]
-        logger.info(f"Loaded {self.size} samples (shared_memory={use_shared_memory})")
-        
-        # 释放原始数据引用
-        del raw_data
+        logger.info(f"Loaded {self.size} samples (mmap={use_mmap})")
     
     def __len__(self):
         return self.size
     
     def __getitem__(self, idx):
-        # 直接返回字典，Tensor切片操作非常快
+        # 直接返回字典
+        # 注意：mmap 模式下需要 clone()，否则返回的是视图可能有问题
         return {
-            'input_ids': self.input_ids[idx],
-            'attention_mask': self.attention_mask[idx],
-            'labels': self.labels[idx],
-            'trg_ref_ids': self.trg_ref_ids[idx],
-            'block_flag': self.block_flag[idx],
-            'error_labels': self.error_labels[idx],
-            'candidate_ids': self.candidate_ids[idx]
+            'input_ids': self.input_ids[idx].clone(),
+            'attention_mask': self.attention_mask[idx].clone(),
+            'labels': self.labels[idx].clone(),
+            'trg_ref_ids': self.trg_ref_ids[idx].clone(),
+            'block_flag': self.block_flag[idx].clone(),
+            'error_labels': self.error_labels[idx].clone(),
+            'candidate_ids': self.candidate_ids[idx].clone()
         }

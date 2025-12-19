@@ -249,7 +249,16 @@ def main():
         if args.preprocessed_train:
             if is_main_process(args):
                 logger.info(f"Loading preprocessed training data from {args.preprocessed_train}")
-            train_dataset = PreprocessedDataset(args.preprocessed_train)
+            
+            # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
+            if args.local_rank != -1:
+                if args.local_rank == 0:
+                    train_dataset = PreprocessedDataset(args.preprocessed_train)
+                dist.barrier()  # rank 0 加载完成后，其他rank再开始
+                if args.local_rank != 0:
+                    train_dataset = PreprocessedDataset(args.preprocessed_train)
+            else:
+                train_dataset = PreprocessedDataset(args.preprocessed_train)
         else:
             # 原始方式：读取txt文件并处理
             train_examples = processor.get_train_examples(args.data_dir, args.train_on)
@@ -297,7 +306,16 @@ def main():
         if args.preprocessed_eval:
             if is_main_process(args):
                 logger.info(f"Loading preprocessed eval data from {args.preprocessed_eval}")
-            eval_dataset = PreprocessedDataset(args.preprocessed_eval)
+            
+            # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
+            if args.local_rank != -1:
+                if args.local_rank == 0:
+                    eval_dataset = PreprocessedDataset(args.preprocessed_eval)
+                dist.barrier()
+                if args.local_rank != 0:
+                    eval_dataset = PreprocessedDataset(args.preprocessed_eval)
+            else:
+                eval_dataset = PreprocessedDataset(args.preprocessed_eval)
         else:
             eval_examples = processor.get_dev_examples(args.data_dir, args.eval_on)
             eval_features = convert_examples_to_dgca_features(
@@ -627,7 +645,16 @@ def main():
         if args.preprocessed_test:
             if is_main_process(args):
                 logger.info(f"Loading preprocessed test data from {args.preprocessed_test}")
-            test_dataset = PreprocessedDataset(args.preprocessed_test)
+            
+            # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
+            if args.local_rank != -1:
+                if args.local_rank == 0:
+                    test_dataset = PreprocessedDataset(args.preprocessed_test)
+                dist.barrier()
+                if args.local_rank != 0:
+                    test_dataset = PreprocessedDataset(args.preprocessed_test)
+            else:
+                test_dataset = PreprocessedDataset(args.preprocessed_test)
         else:
             test_examples = processor.get_test_examples(args.data_dir, args.test_on)
             test_features = convert_examples_to_dgca_features(
