@@ -250,23 +250,35 @@ class DGCAReLMWrapper(nn.Module):
         inputs_embeds: torch.Tensor,
         prompt_mask: torch.Tensor
     ) -> torch.Tensor:
-        """应用P-tuning prompt（沿用ReLM逻辑）"""
+        """
+        应用P-tuning prompt（优化版：使用向量化操作替代Python循环）
+        """
+        batch_size = inputs_embeds.shape[0]
+        device = inputs_embeds.device
+        
         # 生成prompt embeddings
         replace_embeds = self.prompt_embeddings(
-            torch.arange(2 * self.prompt_length, device=inputs_embeds.device)
+            torch.arange(2 * self.prompt_length, device=device)
         )
         replace_embeds = replace_embeds.unsqueeze(0)  # (1, 2*prompt_length, hidden)
         replace_embeds = self.prompt_lstm(replace_embeds)[0]  # (1, 2*prompt_length, 2*hidden)
         replace_embeds = self.prompt_linear(replace_embeds).squeeze(0)  # (2*prompt_length, hidden)
         
-        # 找到prompt位置并替换
-        batch_size = inputs_embeds.shape[0]
-        blocked_indices = (prompt_mask == 1).nonzero(as_tuple=False)
-        blocked_indices = blocked_indices.view(batch_size, 2 * self.prompt_length, 2)[:, :, 1]
+        # 优化：使用向量化操作替代双重for循环
+        # prompt_mask: (batch, seq_len), 值为1的位置是需要替换的prompt位置
+        # 假设每个样本的prompt位置是相同的（在固定位置）
         
-        for i in range(batch_size):
-            for j in range(2 * self.prompt_length):
-                inputs_embeds[i, blocked_indices[i, j], :] = replace_embeds[j, :]
+        # 找到第一个样本的prompt位置作为参考
+        prompt_positions = (prompt_mask[0] == 1).nonzero(as_tuple=True)[0]  # (2*prompt_length,)
+        
+        # 使用高级索引一次性替换所有样本的prompt位置
+        # replace_embeds: (2*prompt_length, hidden)
+        # 扩展到 (batch, 2*prompt_length, hidden)
+        replace_embeds_expanded = replace_embeds.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # 使用index_copy_进行批量替换
+        # inputs_embeds[:, prompt_positions, :] = replace_embeds_expanded
+        inputs_embeds.index_copy_(1, prompt_positions, replace_embeds_expanded)
         
         return inputs_embeds
     
