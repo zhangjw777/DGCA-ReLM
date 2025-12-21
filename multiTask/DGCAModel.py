@@ -255,6 +255,7 @@ class DGCAReLMWrapper(nn.Module):
         """
         batch_size = inputs_embeds.shape[0]
         device = inputs_embeds.device
+        dtype = inputs_embeds.dtype  # 保持与inputs_embeds相同的dtype
         
         # 生成prompt embeddings
         replace_embeds = self.prompt_embeddings(
@@ -263,6 +264,9 @@ class DGCAReLMWrapper(nn.Module):
         replace_embeds = replace_embeds.unsqueeze(0)  # (1, 2*prompt_length, hidden)
         replace_embeds = self.prompt_lstm(replace_embeds)[0]  # (1, 2*prompt_length, 2*hidden)
         replace_embeds = self.prompt_linear(replace_embeds).squeeze(0)  # (2*prompt_length, hidden)
+        
+        # 转换为与inputs_embeds相同的dtype（处理FP16混合精度）
+        replace_embeds = replace_embeds.to(dtype)
         
         # 优化：使用向量化操作替代双重for循环
         # prompt_mask: (batch, seq_len), 值为1的位置是需要替换的prompt位置
@@ -277,7 +281,6 @@ class DGCAReLMWrapper(nn.Module):
         replace_embeds_expanded = replace_embeds.unsqueeze(0).expand(batch_size, -1, -1)
         
         # 使用index_copy_进行批量替换
-        # inputs_embeds[:, prompt_positions, :] = replace_embeds_expanded
         inputs_embeds.index_copy_(1, prompt_positions, replace_embeds_expanded)
         
         return inputs_embeds
