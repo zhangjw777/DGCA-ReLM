@@ -98,6 +98,10 @@ class GatedFusion(nn.Module):
     """
     门控融合模块：动态融合全词表分布和候选集分布
     使用检测信号和hidden state计算门控权重α
+    
+    优化：
+    1. 避免每次创建全词表大小的零张量
+    2. 直接在候选集空间计算，最后再映射
     """
     
     def __init__(self, hidden_size: int, init_bias: float = 0.0):
@@ -139,28 +143,27 @@ class GatedFusion(nn.Module):
         gate_logits = self.gate_linear(gate_input).squeeze(-1)
         gate_weights = torch.sigmoid(gate_logits)
         
-        # 将候选集概率映射到全词表（稀疏）
-        # (batch, seq_len, vocab_size)
-        candidate_probs_ext = torch.zeros(
-            batch_size, seq_len, vocab_size,
-            dtype=candidate_probs.dtype,
-            device=candidate_probs.device
-        )
-        
-        # Scatter候选概率到对应位置
-        candidate_probs_ext.scatter_(
-            dim=-1,
-            index=candidate_ids,
-            src=candidate_probs
-        )
-        
-        # 融合两个分布
-        # p_i = (1 - α_i) * p_vocab + α_i * p_cand
+        # 优化：直接在vocab_logits上修改，避免创建新的大张量
+        # 计算vocab概率
         vocab_probs = F.softmax(vocab_logits, dim=-1)
+        
+        # 计算融合后的概率
+        # 对于候选集中的token：p_fused = (1-α) * p_vocab + α * p_cand
+        # 对于非候选集token：p_fused = (1-α) * p_vocab
+        
         gate_weights_expanded = gate_weights.unsqueeze(-1)  # (batch, seq_len, 1)
         
-        fused_probs = (1 - gate_weights_expanded) * vocab_probs + \
-                      gate_weights_expanded * candidate_probs_ext
+        # 先将vocab_probs乘以(1-α)
+        fused_probs = (1 - gate_weights_expanded) * vocab_probs
+        
+        # 然后使用scatter_add_将候选概率加到对应位置
+        # 这比创建全词表大小的零张量再scatter更高效
+        weighted_candidate_probs = gate_weights_expanded * candidate_probs
+        fused_probs.scatter_add_(
+            dim=-1,
+            index=candidate_ids,
+            src=weighted_candidate_probs
+        )
         
         # 转回logits（避免log(0)）
         fused_logits = torch.log(fused_probs + 1e-10)

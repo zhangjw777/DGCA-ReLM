@@ -169,7 +169,7 @@ def test_dataloader_speed(batch_size=64, num_workers=4, num_iters=100):
     print("="*60)
     
     # 创建假数据集
-    data_size = 10000
+    data_size = 100000000
     seq_len = 128
     
     dataset = TensorDataset(

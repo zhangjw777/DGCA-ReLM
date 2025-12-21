@@ -661,12 +661,14 @@ class PreprocessedDataset(Dataset):
     优化：
     1. 尝试使用 mmap 模式加载（PyTorch 2.1+），避免一次性读入全部数据
     2. 对于旧版本 PyTorch，直接加载
+    3. 使用 contiguous() 替代 clone() 减少CPU开销
     """
     
-    def __init__(self, preprocessed_file: str):
+    def __init__(self, preprocessed_file: str, preload_to_memory: bool = False):
         """
         Args:
             preprocessed_file: 预处理好的.pt文件路径
+            preload_to_memory: 是否预加载到内存（对于大数据集建议False）
         """
         logger.info(f"Loading preprocessed data from {preprocessed_file}")
         
@@ -680,30 +682,59 @@ class PreprocessedDataset(Dataset):
             raw_data = torch.load(preprocessed_file, map_location='cpu')
             use_mmap = False
         
-        # 直接使用加载的数据
-        self.input_ids = raw_data['input_ids']
-        self.attention_mask = raw_data['attention_mask']
-        self.labels = raw_data['labels']
-        self.trg_ref_ids = raw_data['trg_ref_ids']
-        self.block_flag = raw_data['block_flag']
-        self.error_labels = raw_data['error_labels']
-        self.candidate_ids = raw_data['candidate_ids']
+        # 如果preload_to_memory=True，将数据完全加载到内存
+        # 这会占用更多内存，但避免mmap的随机I/O开销
+        if preload_to_memory and use_mmap:
+            logger.info("Preloading data to memory...")
+            self.input_ids = raw_data['input_ids'].clone()
+            self.attention_mask = raw_data['attention_mask'].clone()
+            self.labels = raw_data['labels'].clone()
+            self.trg_ref_ids = raw_data['trg_ref_ids'].clone()
+            self.block_flag = raw_data['block_flag'].clone()
+            self.error_labels = raw_data['error_labels'].clone()
+            self.candidate_ids = raw_data['candidate_ids'].clone()
+            self._preloaded = True
+        else:
+            # 直接使用加载的数据（mmap或普通模式）
+            self.input_ids = raw_data['input_ids']
+            self.attention_mask = raw_data['attention_mask']
+            self.labels = raw_data['labels']
+            self.trg_ref_ids = raw_data['trg_ref_ids']
+            self.block_flag = raw_data['block_flag']
+            self.error_labels = raw_data['error_labels']
+            self.candidate_ids = raw_data['candidate_ids']
+            self._preloaded = not use_mmap  # 非mmap模式相当于已加载到内存
         
         self.size = self.input_ids.shape[0]
-        logger.info(f"Loaded {self.size} samples (mmap={use_mmap})")
+        logger.info(f"Loaded {self.size} samples (mmap={use_mmap}, preloaded={self._preloaded})")
     
     def __len__(self):
         return self.size
     
     def __getitem__(self, idx):
-        # 直接返回字典
-        # 注意：mmap 模式下需要 clone()，否则返回的是视图可能有问题
-        return {
-            'input_ids': self.input_ids[idx].clone(),
-            'attention_mask': self.attention_mask[idx].clone(),
-            'labels': self.labels[idx].clone(),
-            'trg_ref_ids': self.trg_ref_ids[idx].clone(),
-            'block_flag': self.block_flag[idx].clone(),
-            'error_labels': self.error_labels[idx].clone(),
-            'candidate_ids': self.candidate_ids[idx].clone()
-        }
+        # 优化：使用 contiguous() 替代 clone()
+        # contiguous() 只在必要时才复制数据，对于连续内存直接返回自身
+        # 对于mmap数据，需要确保数据被正确读取到内存
+        if self._preloaded:
+            # 数据已在内存，直接索引返回
+            return {
+                'input_ids': self.input_ids[idx],
+                'attention_mask': self.attention_mask[idx],
+                'labels': self.labels[idx],
+                'trg_ref_ids': self.trg_ref_ids[idx],
+                'block_flag': self.block_flag[idx],
+                'error_labels': self.error_labels[idx],
+                'candidate_ids': self.candidate_ids[idx]
+            }
+        else:
+            # mmap模式：需要确保数据被读入内存
+            # 使用 .contiguous() 比 .clone() 更高效
+            return {
+                'input_ids': self.input_ids[idx].contiguous(),
+                'attention_mask': self.attention_mask[idx].contiguous(),
+                'labels': self.labels[idx].contiguous(),
+                'trg_ref_ids': self.trg_ref_ids[idx].contiguous(),
+                'block_flag': self.block_flag[idx].contiguous(),
+                'error_labels': self.error_labels[idx].contiguous(),
+                'candidate_ids': self.candidate_ids[idx].contiguous()
+            }

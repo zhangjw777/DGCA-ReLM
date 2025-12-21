@@ -85,26 +85,36 @@ def set_seed(seed, n_gpu):
 def dynamic_mask_token(inputs, targets, tokenizer, device, mask_mode="noerror", noise_probability=0.2):
     """
     ReLM的masked-FT技术：在源句中随机遮蔽一部分非错误字符
+    优化版：全部在GPU上执行，避免CPU-GPU数据传输
     """
     inputs = inputs.clone()
-    probability_matrix = torch.full(inputs.shape, noise_probability).to(device)
     
-    special_tokens_mask = [
-        tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) 
-        for val in inputs.tolist()
-    ]
-    special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool).to(device)
+    # 直接在GPU上创建概率矩阵
+    probability_matrix = torch.full(inputs.shape, noise_probability, device=device)
+    
+    # 构建special tokens mask（在GPU上）
+    # 使用向量化操作替代列表推导
+    pad_id = tokenizer.pad_token_id
+    cls_id = tokenizer.cls_token_id
+    sep_id = tokenizer.sep_token_id
+    mask_id = tokenizer.mask_token_id
+    
+    special_tokens_mask = (
+        (inputs == pad_id) | 
+        (inputs == cls_id) | 
+        (inputs == sep_id) |
+        (inputs == mask_id)
+    )
     probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
     
     if mask_mode == "noerror":
         probability_matrix.masked_fill_(inputs != targets, value=0.0)
     elif mask_mode == "error":
         probability_matrix.masked_fill_(inputs == targets, value=0.0)
-    else:
-        assert mask_mode == "all"
+    # else: mask_mode == "all", keep as is
     
     masked_indices = torch.bernoulli(probability_matrix).bool()
-    inputs[masked_indices] = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+    inputs[masked_indices] = mask_id
     
     return inputs
 
@@ -176,6 +186,10 @@ def main():
     parser.add_argument("--fp16", action="store_true", help="是否使用混合精度")
     parser.add_argument("--local_rank", type=int, default=-1, help="DDP local rank")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader的工作进程数")
+    parser.add_argument("--preload_data", action="store_true", 
+                        help="预加载数据到内存（需要足够RAM，但可显著提升速度）")
+    parser.add_argument("--prefetch_factor", type=int, default=2,
+                        help="DataLoader预取因子，每个worker预取的batch数量")
     
     # ============ ReLM相关 ============
     parser.add_argument("--mft", action="store_true", help="masked-fine-tuning")
@@ -253,16 +267,27 @@ def main():
         if args.preprocessed_train:
             if is_main_process(args):
                 logger.info(f"Loading preprocessed training data from {args.preprocessed_train}")
+                if args.preload_data:
+                    logger.info("Preloading data to memory (this may take a while for large datasets)...")
             
             # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
             if args.local_rank != -1:
                 if args.local_rank == 0:
-                    train_dataset = PreprocessedDataset(args.preprocessed_train)
+                    train_dataset = PreprocessedDataset(
+                        args.preprocessed_train, 
+                        preload_to_memory=args.preload_data
+                    )
                 dist.barrier()  # rank 0 加载完成后，其他rank再开始
                 if args.local_rank != 0:
-                    train_dataset = PreprocessedDataset(args.preprocessed_train)
+                    train_dataset = PreprocessedDataset(
+                        args.preprocessed_train,
+                        preload_to_memory=args.preload_data
+                    )
             else:
-                train_dataset = PreprocessedDataset(args.preprocessed_train)
+                train_dataset = PreprocessedDataset(
+                    args.preprocessed_train,
+                    preload_to_memory=args.preload_data
+                )
         else:
             # 原始方式：读取txt文件并处理
             train_examples = processor.get_train_examples(args.data_dir, args.train_on)
@@ -290,14 +315,22 @@ def main():
         
         # 计算实际batch size
         per_device_batch_size = args.train_batch_size // args.gradient_accumulation_steps
-        train_dataloader = DataLoader(
-            train_dataset,
-            sampler=train_sampler,
-            batch_size=per_device_batch_size,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=True if args.num_workers > 0 else False
-        )
+        
+        # DataLoader优化配置
+        dataloader_kwargs = {
+            'sampler': train_sampler,
+            'batch_size': per_device_batch_size,
+            'num_workers': args.num_workers,
+            'pin_memory': True,
+            'persistent_workers': args.num_workers > 0,
+            'drop_last': True,  # 避免最后一个batch大小不一致导致的问题
+        }
+        
+        # 添加prefetch_factor（需要num_workers > 0）
+        if args.num_workers > 0:
+            dataloader_kwargs['prefetch_factor'] = args.prefetch_factor
+        
+        train_dataloader = DataLoader(train_dataset, **dataloader_kwargs)
         
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         if args.max_train_steps is None:
