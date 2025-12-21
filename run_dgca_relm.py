@@ -10,6 +10,10 @@ import logging
 import os
 import random
 import math
+
+# 禁用 tokenizers 的并行，避免与 DataLoader 多进程冲突
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import numpy as np
 import torch
 import torch.nn as nn
