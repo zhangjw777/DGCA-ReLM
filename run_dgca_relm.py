@@ -170,8 +170,11 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--lr_scheduler_type", type=SchedulerType, default="linear")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save_steps", type=int, default=500)
-    parser.add_argument("--logging_steps", type=int, default=100)
+    parser.add_argument("--save_steps", type=int, default=5000,
+                        help="保存模型的频率（默认5000步）")
+    parser.add_argument("--eval_steps", type=int, default=None,
+                        help="评估频率（默认=save_steps，大数据集建议设置更大值如10000-50000）")
+    parser.add_argument("--logging_steps", type=int, default=1000)
     
     # ============ Early Stopping ============
     parser.add_argument("--early_stopping_patience", type=int, default=None,
@@ -190,6 +193,12 @@ def main():
                         help="预加载数据到内存（需要足够RAM，但可显著提升速度）")
     parser.add_argument("--prefetch_factor", type=int, default=2,
                         help="DataLoader预取因子，每个worker预取的batch数量")
+    
+    # ============ DDP优化参数 ============
+    parser.add_argument("--ddp_bucket_cap_mb", type=int, default=100,
+                        help="DDP bucket大小(MB)，低带宽环境建议设置更大值如200")
+    parser.add_argument("--ddp_static_graph", action="store_true",
+                        help="启用static_graph优化（适合固定计算图的模型）")
     
     # ============ ReLM相关 ============
     parser.add_argument("--mft", action="store_true", help="masked-fine-tuning")
@@ -396,9 +405,22 @@ def main():
         if is_main_process(args):
             logger.info(f"Loaded model from {args.load_state_dict}")
     
-    # DDP包装
+    # DDP包装（优化配置）
     if args.local_rank != -1:
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+        ddp_kwargs = {
+            'device_ids': [args.local_rank],
+            'output_device': args.local_rank,
+            'bucket_cap_mb': args.ddp_bucket_cap_mb,
+            'gradient_as_bucket_view': True,  # 减少内存拷贝
+        }
+        if args.ddp_static_graph:
+            ddp_kwargs['static_graph'] = True
+        
+        model = DDP(model, **ddp_kwargs)
+        
+        if is_main_process(args):
+            logger.info(f"DDP config: bucket_cap_mb={args.ddp_bucket_cap_mb}, "
+                       f"gradient_as_bucket_view=True, static_graph={args.ddp_static_graph}")
     
     # ============ 优化器 ============
     if args.do_train:
@@ -462,6 +484,11 @@ def main():
             logger.info(f"  Num epochs = {args.num_train_epochs}")
             logger.info(f"  Num update steps = {args.max_train_steps}")
             logger.info(f"  DataLoader num_workers = {args.num_workers}")
+            
+            # DDP优化提示
+            if args.local_rank != -1 and args.gradient_accumulation_steps > 1:
+                logger.info(f"  🚀 DDP no_sync优化已启用：每{args.gradient_accumulation_steps}步通信1次")
+            
             # 保存训练参数
             torch.save(args, os.path.join(args.output_dir, "train_args.bin"))
         
@@ -559,11 +586,24 @@ def main():
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
                 
-                # 反向传播
-                if args.fp16:
-                    scaler.scale(loss).backward()
+                # 反向传播（使用no_sync优化DDP通信）
+                # 在梯度累积的中间步骤跳过AllReduce，只在最后一步通信
+                is_accumulation_step = (step + 1) % args.gradient_accumulation_steps != 0
+                is_last_step = step == len(train_dataloader) - 1
+                
+                # 决定是否使用no_sync上下文
+                if args.local_rank != -1 and is_accumulation_step and not is_last_step:
+                    # DDP模式下的中间累积步骤：跳过梯度同步
+                    sync_context = model.no_sync()
                 else:
-                    loss.backward()
+                    # 非DDP模式或需要同步的步骤
+                    sync_context = torch.enable_grad()
+                
+                with sync_context:
+                    if args.fp16:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
                 
                 train_loss += loss.item()
                 train_steps += 1
@@ -609,7 +649,9 @@ def main():
                         accumulated_losses = {k: 0.0 for k in accumulated_losses}
                 
                 # 验证和保存
-                if args.do_eval and global_step % args.save_steps == 0 and is_main_process(args):
+                # 使用eval_steps控制评估频率，默认与save_steps相同
+                eval_step_interval = args.eval_steps if args.eval_steps else args.save_steps
+                if args.do_eval and global_step % eval_step_interval == 0 and is_main_process(args):
                     eval_result = evaluate(
                         model, eval_dataloader, tokenizer, device, args, dgca_config
                     )

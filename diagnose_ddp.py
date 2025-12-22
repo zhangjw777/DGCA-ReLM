@@ -4,15 +4,18 @@ DDP双卡性能诊断脚本
 
 使用方法:
 NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=1 torchrun --nproc_per_node=2 diagnose_ddp.py
+
+如果只想运行通信测试:
+NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=1 torchrun --nproc_per_node=2 diagnose_ddp.py --comm_only
 """
 
 import os
+import sys
 import time
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from transformers import BertForMaskedLM, AutoTokenizer
 
 # 测试配置
 BATCH_SIZE = 64  # 每卡的batch size
@@ -20,12 +23,20 @@ SEQ_LEN = 128
 NUM_ITERS = 20
 WARMUP_ITERS = 5
 
+# 设置超时时间（避免卡住）
+NCCL_TIMEOUT = 120  # 秒
+
 
 def setup():
     """初始化DDP"""
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='nccl')
+    
+    # 设置NCCL超时
+    dist.init_process_group(
+        backend='nccl',
+        timeout=torch.distributed.distributed_c10d.timedelta(seconds=NCCL_TIMEOUT)
+    )
     return local_rank
 
 
@@ -85,12 +96,23 @@ def test_nccl_bandwidth(local_rank):
 
 
 def test_pure_bert_ddp(local_rank):
-    """测试2: 纯BERT DDP训练（不含DGCA模块）"""
+    """测试2: 纯BERT DDP训练（不含DGCA模块）- 使用本地模型避免下载"""
     print_rank0("\n" + "="*60, local_rank)
     print_rank0(f"测试2: 纯BERT DDP训练 (batch_size={BATCH_SIZE}/卡)", local_rank)
     print_rank0("="*60, local_rank)
     
-    model = BertForMaskedLM.from_pretrained('bert-base-chinese').cuda(local_rank)
+    # 延迟导入，避免影响通信测试
+    from transformers import BertForMaskedLM, BertConfig
+    
+    # 使用本地配置创建模型，避免网络下载
+    try:
+        model = BertForMaskedLM.from_pretrained('bert-base-chinese', local_files_only=True).cuda(local_rank)
+    except:
+        print_rank0("  无法加载bert-base-chinese，使用随机初始化的BERT模型", local_rank)
+        config = BertConfig(vocab_size=21128, hidden_size=768, num_hidden_layers=12, 
+                           num_attention_heads=12, intermediate_size=3072)
+        model = BertForMaskedLM(config).cuda(local_rank)
+    
     model = DDP(model, device_ids=[local_rank])
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)

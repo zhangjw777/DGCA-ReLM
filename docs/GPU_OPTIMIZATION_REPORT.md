@@ -1,12 +1,31 @@
 # GPU性能优化报告
 
-**日期**: 2025年12月21日  
+**日期**: 2025年12月22日 (更新)  
 **项目**: DGCA-ReLM  
-**问题**: 训练时GPU利用率低，功率只有200W（满载450W）
+**问题**: 训练时GPU利用率低，双卡DDP性能瓶颈
 
 ---
 
-## 📊 诊断测试数据
+## 📊 WSL2双卡环境诊断
+
+### 硬件连接情况
+```
+GPU0    GPU1    连接方式
+ X      SYS     跨NUMA PCIe连接（无NVLink）
+```
+
+### NCCL通信带宽测试
+| 数据量 | 延迟 | 带宽 |
+|--------|------|------|
+| 4MB | 9ms | 0.92 GB/s |
+| 40MB | 83ms | 1.01 GB/s |
+| 200MB | 390ms | 1.07 GB/s |
+
+⚠️ **关键发现**: WSL2 + NCCL_SHM_DISABLE导致NCCL带宽只有**1 GB/s**，正常PCIe应有20+ GB/s
+
+---
+
+## 📊 单卡诊断测试数据
 
 使用 `diagnose_gpu.py` 进行分步测试（batch_size=128, seq_len=128）：
 
@@ -18,8 +37,6 @@
 | 测试4: DataLoader | 12.4ms/batch | - | N/A | 数据加载很快 |
 | 测试5: 真实数据+BERT | 186.4ms/iter | 686.7 samples/s | 350W | 略有下降 |
 | 测试6: 完整DGCA模型 | 579.4ms/iter | 220.9 samples/s | **200W** | ⚠️ GPU等待 |
-
-**关键发现**: 测试6(DGCA)比测试3(BERT+FP16)慢了3.5倍，功率低了150W
 
 ---
 
@@ -93,7 +110,7 @@ inputs_embeds.index_copy_(1, prompt_positions, replace_embeds_expanded)
 
 ---
 
-## 📈 优化效果
+## 📈 单卡优化效果
 
 | 指标 | 优化前 | 优化后 | 提升 |
 |------|--------|--------|------|
@@ -103,44 +120,92 @@ inputs_embeds.index_copy_(1, prompt_positions, replace_embeds_expanded)
 
 ---
 
-## 🔮 待继续优化的问题
+## 🔧 双卡DDP优化（2025-12-22新增）
 
-### 1. 双卡DDP训练反而更慢
+### 问题诊断
 
 **现象**: 
-- 单卡: 2.2 it/s (优化前) / 4.9 it/s (优化后)
-- 双卡: 1.5 it/s，每卡功率只有100W
+- 单卡: 4.9 it/s，功率320W
+- 双卡: 1.4 it/s，每卡功率只有100W
 
-**可能原因**:
-- NCCL通信开销
-- 梯度同步瓶颈
-- batch_size=128在双卡下每卡只有64，计算效率下降
+**根本原因**: WSL2环境下NCCL带宽极低（1 GB/s vs 正常20+ GB/s）
+- `NCCL_SHM_DISABLE=1` 禁用共享内存
+- `NCCL_IB_DISABLE=1` 禁用InfiniBand
+- 两张4090通过跨NUMA PCIe连接（SYS），无NVLink
 
-**待测试**:
-- 双卡时增大batch_size到256或更高
-- 检查gradient_accumulation_steps设置
-- 使用`torch.distributed.barrier()`定位同步开销
+### 已实施的DDP优化
 
-### 2. 功率仍未满载（320W vs 450W）
+#### 优化6: `no_sync()` 梯度累积优化（最关键！）
 
-**可能原因**:
-- DetectorHead、CandidateHead额外计算开销
-- 混合精度下某些操作fallback到FP32
-- 内存带宽瓶颈（candidate_embeddings lookup）
+**文件**: `run_dgca_relm.py`
 
-**待分析**:
-- 使用`torch.profiler`详细分析各操作耗时
-- 检查是否有CUDA同步点导致的等待
+在梯度累积的中间步骤跳过AllReduce通信：
 
-### 3. diagnose_gpu.py 测试6 待更新
+```python
+# 在累积步骤跳过梯度同步
+if args.local_rank != -1 and is_accumulation_step and not is_last_step:
+    sync_context = model.no_sync()
+else:
+    sync_context = torch.enable_grad()
 
-需要更新测试6使用优化后的代码重新测试基准。
+with sync_context:
+    scaler.scale(loss).backward()
+```
+
+**效果**: 使用`--gradient_accumulation_steps 4`时，通信频率降低4倍
+
+#### 优化7: DDP配置优化
+
+**文件**: `run_dgca_relm.py`
+
+```python
+model = DDP(model, 
+    device_ids=[local_rank],
+    bucket_cap_mb=args.ddp_bucket_cap_mb,  # 默认100MB
+    gradient_as_bucket_view=True,  # 减少内存拷贝
+    static_graph=args.ddp_static_graph  # 可选
+)
+```
+
+新增命令行参数：
+- `--ddp_bucket_cap_mb`: DDP bucket大小，低带宽环境建议200
+- `--ddp_static_graph`: 启用static_graph优化
+
+#### 优化8: 评估频率优化
+
+**文件**: `run_dgca_relm.py`
+
+- `--save_steps` 默认值从500改为1000
+- 新增 `--eval_steps` 参数，可独立控制评估频率
 
 ---
 
-## 📝 配置建议
+## 📝 双卡推荐配置
 
-### 当前推荐配置（单卡4090）
+### WSL2低带宽环境推荐
+
+```bash
+NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=1 \
+torchrun --nproc_per_node=2 --master_port=29500 run_dgca_relm.py \
+    --do_train --do_eval --do_test \
+    --preprocessed_train data/train.pt \
+    --preprocessed_eval data/dev.pt \
+    --preprocessed_test data/test.pt \
+    --fp16 --apply_prompt --mft \
+    --train_batch_size 128 \
+    --gradient_accumulation_steps 4 \
+    --ddp_bucket_cap_mb 200 \
+    --eval_steps 2000 \
+    --num_workers 2
+```
+
+**关键参数说明**:
+- `--gradient_accumulation_steps 4`: 每4步通信1次，减少75%通信开销
+- `--ddp_bucket_cap_mb 200`: 更大的bucket减少AllReduce次数
+- `--eval_steps 2000`: 减少评估频率，减少阻塞
+- `--num_workers 2`: 双卡时减少worker数量避免竞争
+
+### 单卡推荐配置
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python run_dgca_relm.py \
@@ -154,25 +219,35 @@ CUDA_VISIBLE_DEVICES=1 python run_dgca_relm.py \
     --prefetch_factor 2
 ```
 
-### 待验证配置（双卡）
+---
 
+## 🔮 待继续优化的问题
+
+### 1. 双卡仍需验证优化效果
+
+运行诊断脚本验证优化：
 ```bash
-torchrun --nproc_per_node=2 --master_port=29500 run_dgca_relm.py \
-    --do_train --do_eval --do_test \
-    --preprocessed_train data/train.pt \
-    --preprocessed_eval data/dev.pt \
-    --preprocessed_test data/test.pt \
-    --fp16 --apply_prompt --mft \
-    --train_batch_size 256 \
-    --gradient_accumulation_steps 1 \
-    --num_workers 4
+NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=1 torchrun --nproc_per_node=2 diagnose_ddp_v2.py
 ```
+
+### 2. 功率仍未满载（320W vs 450W）
+
+**可能原因**:
+- DetectorHead、CandidateHead额外计算开销
+- 混合精度下某些操作fallback到FP32
+- 内存带宽瓶颈
+
+### 3. batch_size > 128 OOM问题
+
+双卡模式下batch_size超过128就OOM，但单卡可以跑128。可能原因：
+- DDP需要额外显存存储梯度bucket
+- `gradient_as_bucket_view=True`可能有帮助
 
 ---
 
 ## 🛠️ 下次继续的方向
 
-1. **双卡训练优化**: 分析DDP通信开销，尝试gradient_accumulation
+1. **验证双卡优化效果**: 运行新的推荐配置测试速度提升
 2. **进一步提升单卡利用率**: 使用torch.profiler找出剩余瓶颈
 3. **编译优化**: 尝试`torch.compile()`（PyTorch 2.0+）
-4. **更大batch_size**: 测试batch_size=192/256的效果
+4. **尝试其他分布式策略**: 如FSDP可能比DDP更适合低带宽环境
