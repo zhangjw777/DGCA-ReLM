@@ -773,9 +773,7 @@ def main():
         
         if is_main_process(args):
             logger.info("***** Running test *****")
-            logger.info(f"  Num examples = {len(test_examples)}")
-        
-        test_result = evaluate(
+        logger.info(f"  Num examples = {len(test_dataset)}")
             model, test_dataloader, tokenizer, device, args, dgca_config,
             save_predictions=True,
             output_dir=args.output_dir

@@ -13,7 +13,7 @@ from typing import Optional, Tuple, Dict
 class DetectorHead(nn.Module):
     """
     检测分支：预测每个位置是否为错误
-    输入源句hidden states，输出每个位置的错误概率
+    输入源句hidden states，输出logits（未经sigmoid）
     """
     
     def __init__(self, hidden_size: int, dropout: float = 0.1):
@@ -23,13 +23,14 @@ class DetectorHead(nn.Module):
         self.classifier = nn.Linear(hidden_size, 1)
         self.activation = nn.Tanh()
     
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, return_probs: bool = False) -> torch.Tensor:
         """
         Args:
             hidden_states: (batch, seq_len, hidden_size) 源句的hidden states
+            return_probs: 是否返回概率（sigmoid后），默认返回logits
             
         Returns:
-            detection_probs: (batch, seq_len) 每个位置的错误概率
+            detection_logits or detection_probs: (batch, seq_len)
         """
         # (batch, seq_len, hidden_size)
         x = self.dropout(hidden_states)
@@ -39,9 +40,10 @@ class DetectorHead(nn.Module):
         
         # (batch, seq_len, 1) -> (batch, seq_len)
         logits = self.classifier(x).squeeze(-1)
-        probs = torch.sigmoid(logits)
         
-        return probs
+        if return_probs:
+            return torch.sigmoid(logits)
+        return logits
 
 
 class CandidateHead(nn.Module):
@@ -328,10 +330,12 @@ class DGCAReLMWrapper(nn.Module):
         sequence_output = outputs.last_hidden_state  # (batch, seq_len, hidden)
         
         # ========== 检测分支 ==========
+        detection_logits = None
         detection_probs = None
         detection_loss = None
         if self.detector_head is not None:
-            detection_probs = self.detector_head(sequence_output)
+            detection_logits = self.detector_head(sequence_output, return_probs=False)
+            detection_probs = torch.sigmoid(detection_logits)
             
             # 计算检测损失
             if error_labels is not None and self.training:
@@ -339,15 +343,14 @@ class DGCAReLMWrapper(nn.Module):
                 if valid_mask.any():
                     pos_weight = torch.tensor(
                         [self.config.detector_pos_weight],
-                        device=detection_probs.device
+                        device=detection_logits.device
                     )
                     detection_loss_fn = nn.BCEWithLogitsLoss(
                         pos_weight=pos_weight,
                         reduction='none'
                     )
-                    # 需要logits，重新计算
-                    det_logits = torch.log(detection_probs / (1 - detection_probs + 1e-10))
-                    det_loss = detection_loss_fn(det_logits, error_labels.float())
+                    # 直接使用logits，不需要转换
+                    det_loss = detection_loss_fn(detection_logits, error_labels.float())
                     detection_loss = (det_loss * valid_mask.float()).sum() / valid_mask.float().sum()
         
         # ========== MLM logits（全词表） ==========
