@@ -114,12 +114,20 @@ class ConfusionSet:
     
     def _build_candidate_mapping(self):
         """构建token id到候选集的映射"""
+        unk_id = self.tokenizer.unk_token_id
+        skipped_unk = 0
+        
         for char, confusions in self.confusion_dict.items():
             # 获取字符的token id
             char_ids = self.tokenizer.encode(char, add_special_tokens=False)
             if len(char_ids) != 1:
                 continue  # 跳过多字符token
             char_id = char_ids[0]
+            
+            # 跳过 UNK token（避免多个OOV字覆盖同一个映射）
+            if char_id == unk_id:
+                skipped_unk += 1
+                continue
             
             # 构建候选列表
             candidates = []
@@ -133,6 +141,9 @@ class ConfusionSet:
                 conf_ids = self.tokenizer.encode(conf_char, add_special_tokens=False)
                 if len(conf_ids) == 1:
                     conf_id = conf_ids[0]
+                    # 跳过 UNK 混淆字符
+                    if conf_id == unk_id:
+                        continue
                     if conf_id not in candidates:
                         candidates.append(conf_id)
                 
@@ -141,6 +152,9 @@ class ConfusionSet:
                     break
             
             self.token_to_candidates[char_id] = candidates
+        
+        if skipped_unk > 0:
+            print(f"跳过了 {skipped_unk} 个 UNK 字符的映射")
     
     def get_candidates(self, token_id: int) -> List[int]:
         """

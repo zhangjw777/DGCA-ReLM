@@ -90,8 +90,16 @@ class CandidateHead(nn.Module):
         if candidate_mask is not None:
             scores = scores.masked_fill(~candidate_mask, float('-inf'))
         
+        # 防护：如果某位置候选集全为pad（全-inf），softmax会产生NaN
+        # 检测全-inf的位置，将其probs设为均匀分布或0
+        all_masked = candidate_mask is not None and (~candidate_mask).all(dim=-1, keepdim=True)
+        
         # Softmax得到概率分布
         probs = F.softmax(scores, dim=-1)
+        
+        # 对全pad位置，将NaN替换为0（这些位置后续会被attention_mask屏蔽）
+        if candidate_mask is not None:
+            probs = probs.masked_fill(all_masked.expand_as(probs), 0.0)
         
         return probs
 

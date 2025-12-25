@@ -83,14 +83,15 @@ def convert_examples_to_dgca_features(
         example.src = src
         example.trg = trg
         
-        # Tokenize
+        # Tokenize（add_special_tokens=False 确保 block_flag 对齐）
         encoded_inputs = tokenizer(
             example.src,
             max_length=max_seq_length,
             padding="max_length",
             truncation=True,
             return_token_type_ids=True,
-            is_split_into_words=True
+            is_split_into_words=True,
+            add_special_tokens=False
         )
         
         trg_ids = tokenizer(
@@ -99,7 +100,8 @@ def convert_examples_to_dgca_features(
             padding="max_length",
             truncation=True,
             return_token_type_ids=True,
-            is_split_into_words=True
+            is_split_into_words=True,
+            add_special_tokens=False
         )["input_ids"]
         
         trg_ref_ids = tokenizer(
@@ -108,14 +110,15 @@ def convert_examples_to_dgca_features(
             padding="max_length",
             truncation=True,
             return_token_type_ids=True,
-            is_split_into_words=True
+            is_split_into_words=True,
+            add_special_tokens=False
         )["input_ids"]
         
         src_ids = encoded_inputs["input_ids"]
         attention_mask = encoded_inputs["attention_mask"]
         
-        # 处理block_flag
-        block_flag = ([0] + block_flag)[:max_seq_length]
+        # 处理block_flag：直接使用，无需额外补0
+        block_flag = block_flag[:max_seq_length]
         if len(block_flag) < max_seq_length:
             block_flag = block_flag + [0] * (max_seq_length - len(block_flag))
         
@@ -147,14 +150,19 @@ def convert_examples_to_dgca_features(
         
         # ========== 生成candidate_ids ==========
         # 为每个位置生成候选集
+        # PAD位置全部填充pad_token_id，避免引入噪声
+        pad_id = tokenizer.pad_token_id
         candidate_ids_list = []
-        for src_id in src_ids:
-            candidates = confusion_set.get_candidates(src_id)
-            # Pad到candidate_size
-            padded_candidates = candidates + [tokenizer.pad_token_id] * (
-                confusion_set.candidate_size - len(candidates)
-            )
-            candidate_ids_list.append(padded_candidates[:confusion_set.candidate_size])
+        for idx, src_id in enumerate(src_ids):
+            if attention_mask[idx] == 0:  # PAD位置
+                candidate_ids_list.append([pad_id] * confusion_set.candidate_size)
+            else:
+                candidates = confusion_set.get_candidates(src_id)
+                # Pad到candidate_size
+                padded_candidates = candidates + [pad_id] * (
+                    confusion_set.candidate_size - len(candidates)
+                )
+                candidate_ids_list.append(padded_candidates[:confusion_set.candidate_size])
         
         # 验证长度
         assert len(src_ids) == max_seq_length
@@ -188,7 +196,6 @@ def convert_examples_to_dgca_features(
         )
     
     return features
-
 
 def generate_error_labels(
     src_ids: List[int],
@@ -256,7 +263,16 @@ def convert_examples_to_prompts(
     src, trg, prompt_length, max_seq_length, tokenizer, anchor=None, mask_rate=0.2
 ):
     """
-    沿用ReLM的prompt转换逻辑
+    ReLM的prompt转换逻辑
+    
+    输出格式：
+    - prompt_src: [CLS]*P + src + [SEP]*P + [MASK]*len(trg)  (模型输入)
+    - prompt_trg: [CLS]*P + src + [SEP]*P + trg              (目标输出)
+    - block_flag: 标记哪些位置是prompt（用于prompt embedding）
+    - trg_ref:    [CLS]*P + src + [SEP]*P + src              (参考，用于生成error_labels)
+    
+    注意：trg_ref 的后半段是 src（原始错误句），这样在 mask 段比较 trg_ref vs trg 
+    才能正确判断哪些位置有错（src[i] != trg[i] 表示有错）
     """
     def truncate(x, max_length):
         return x[:max_length]
@@ -272,8 +288,9 @@ def convert_examples_to_prompts(
                      [tokenizer.sep_token] * prompt_length + trg
         block_flag = [1] * prompt_length + [0 for _ in src] + [0 for _ in anchor] + \
                      [1] * prompt_length + [0 for _ in trg]
-        trg_ref = [tokenizer.cls_token] * prompt_length + trg + anchor + \
-                  [tokenizer.sep_token] * prompt_length + trg
+        # trg_ref后半段是src，用于判断哪些位置有错
+        trg_ref = [tokenizer.cls_token] * prompt_length + src + anchor + \
+                  [tokenizer.sep_token] * prompt_length + src
     else:
         prompt_src = [tokenizer.cls_token] * prompt_length + src + \
                      [tokenizer.sep_token] * prompt_length + [tokenizer.mask_token for _ in trg]
@@ -281,8 +298,9 @@ def convert_examples_to_prompts(
                      [tokenizer.sep_token] * prompt_length + trg
         block_flag = [1] * prompt_length + [0 for _ in src] + \
                      [1] * prompt_length + [0 for _ in trg]
-        trg_ref = [tokenizer.cls_token] * prompt_length + trg + \
-                  [tokenizer.sep_token] * prompt_length + trg
+        # trg_ref后半段是src，用于判断哪些位置有错
+        trg_ref = [tokenizer.cls_token] * prompt_length + src + \
+                  [tokenizer.sep_token] * prompt_length + src
     
     return prompt_src, prompt_trg, block_flag, trg_ref
 
@@ -319,14 +337,14 @@ def create_dgca_dataset(features: List[DGCAInputFeatures]) -> TensorDataset:
 
 
 # ============================================================================
-# 以下是针对百万级数据的优化版本
+# 以下是针对百万级数据的优化版本（已废弃，保留仅供参考）
+# 新版请使用 preprocess_data.py 预处理为 jsonl 格式，配合 PreprocessedDataset 使用
 # ============================================================================
 
 class DGCALazyDataset(Dataset):
     """
-    懒加载Dataset，用于百万级大规模数据
-    不一次性将所有数据加载到内存，而是按需加载
-    支持预处理缓存，加速后续训练
+    【已废弃】懒加载Dataset，用于百万级大规模数据
+    请使用 preprocess_data.py 预处理为 jsonl 格式
     """
     
     def __init__(
@@ -658,32 +676,57 @@ class PreprocessedDataset(Dataset):
     """
     加载预处理好的数据集
     
-    优化：
-    1. 尝试使用 mmap 模式加载（PyTorch 2.1+），避免一次性读入全部数据
-    2. 对于旧版本 PyTorch，直接加载
-    3. 使用 contiguous() 替代 clone() 减少CPU开销
+    支持两种格式：
+    1. .pt 文件（PyTorch tensor格式，旧版）
+    2. .jsonl 文件（JSON Lines格式，新版推荐）
     """
     
     def __init__(self, preprocessed_file: str, preload_to_memory: bool = False):
         """
         Args:
-            preprocessed_file: 预处理好的.pt文件路径
-            preload_to_memory: 是否预加载到内存（对于大数据集建议False）
+            preprocessed_file: 预处理好的文件路径（.pt 或 .jsonl）
+            preload_to_memory: 是否预加载到内存
         """
         logger.info(f"Loading preprocessed data from {preprocessed_file}")
         
-        # 尝试使用 mmap 模式加载（PyTorch 2.1+ 支持）
-        # mmap 模式下数据按需读取，初始加载非常快
+        self._preloaded = False
+        
+        if preprocessed_file.endswith('.jsonl'):
+            self._load_jsonl(preprocessed_file)
+        else:
+            self._load_pt(preprocessed_file, preload_to_memory)
+    
+    def _load_jsonl(self, filepath: str):
+        """加载 jsonl 格式的预处理数据"""
+        from datasets import load_dataset
+        
+        # 使用 datasets 库加载 jsonl
+        ds = load_dataset('json', data_files=filepath, split='train')
+        
+        # 设置 torch 格式
+        ds.set_format(type='torch', columns=[
+            'input_ids', 'attention_mask', 'labels', 
+            'trg_ref_ids', 'block_flag', 'error_labels', 'candidate_ids'
+        ])
+        
+        self._hf_dataset = ds
+        self.size = len(ds)
+        self._preloaded = True  # datasets 库自带高效缓存
+        
+        logger.info(f"Loaded {self.size} samples from jsonl (using HuggingFace datasets)")
+    
+    def _load_pt(self, filepath: str, preload_to_memory: bool):
+        """加载 pt 格式的预处理数据（保持兼容）"""
+        self._hf_dataset = None
+        
+        # 尝试使用 mmap 模式加载
         try:
-            raw_data = torch.load(preprocessed_file, map_location='cpu', mmap=True)
+            raw_data = torch.load(filepath, map_location='cpu', mmap=True)
             use_mmap = True
         except TypeError:
-            # 旧版本 PyTorch 不支持 mmap 参数
-            raw_data = torch.load(preprocessed_file, map_location='cpu')
+            raw_data = torch.load(filepath, map_location='cpu')
             use_mmap = False
         
-        # 如果preload_to_memory=True，将数据完全加载到内存
-        # 这会占用更多内存，但避免mmap的随机I/O开销
         if preload_to_memory and use_mmap:
             logger.info("Preloading data to memory...")
             self.input_ids = raw_data['input_ids'].clone()
@@ -695,7 +738,6 @@ class PreprocessedDataset(Dataset):
             self.candidate_ids = raw_data['candidate_ids'].clone()
             self._preloaded = True
         else:
-            # 直接使用加载的数据（mmap或普通模式）
             self.input_ids = raw_data['input_ids']
             self.attention_mask = raw_data['attention_mask']
             self.labels = raw_data['labels']
@@ -703,20 +745,21 @@ class PreprocessedDataset(Dataset):
             self.block_flag = raw_data['block_flag']
             self.error_labels = raw_data['error_labels']
             self.candidate_ids = raw_data['candidate_ids']
-            self._preloaded = not use_mmap  # 非mmap模式相当于已加载到内存
+            self._preloaded = not use_mmap
         
         self.size = self.input_ids.shape[0]
-        logger.info(f"Loaded {self.size} samples (mmap={use_mmap}, preloaded={self._preloaded})")
+        logger.info(f"Loaded {self.size} samples from pt (mmap={use_mmap}, preloaded={self._preloaded})")
     
     def __len__(self):
         return self.size
     
     def __getitem__(self, idx):
-        # 优化：使用 contiguous() 替代 clone()
-        # contiguous() 只在必要时才复制数据，对于连续内存直接返回自身
-        # 对于mmap数据，需要确保数据被正确读取到内存
+        # jsonl 格式（使用 HuggingFace datasets）
+        if self._hf_dataset is not None:
+            return self._hf_dataset[idx]
+        
+        # pt 格式
         if self._preloaded:
-            # 数据已在内存，直接索引返回
             return {
                 'input_ids': self.input_ids[idx],
                 'attention_mask': self.attention_mask[idx],
@@ -727,8 +770,6 @@ class PreprocessedDataset(Dataset):
                 'candidate_ids': self.candidate_ids[idx]
             }
         else:
-            # mmap模式：需要确保数据被读入内存
-            # 使用 .contiguous() 比 .clone() 更高效
             return {
                 'input_ids': self.input_ids[idx].contiguous(),
                 'attention_mask': self.attention_mask[idx].contiguous(),

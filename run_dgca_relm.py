@@ -322,8 +322,9 @@ def main():
         else:
             train_sampler = RandomSampler(train_dataset)
         
-        # 计算实际batch size
-        per_device_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+        # batch_size语义：train_batch_size 是每卡的 micro-batch 大小
+        # 有效batch = train_batch_size * gradient_accumulation_steps * num_gpus
+        per_device_batch_size = args.train_batch_size
         
         # DataLoader优化配置
         dataloader_kwargs = {
@@ -424,6 +425,18 @@ def main():
     
     # ============ 优化器 ============
     if args.do_train:
+        # 【重要】先冻结LM参数，再创建optimizer，避免optimizer持有冻结参数
+        if args.freeze_lm:
+            trainable_params = ["prompt_embeddings", "prompt_lstm", "prompt_linear",
+                               "detector_head", "candidate_head", "gated_fusion"]
+            frozen_count = 0
+            for n, p in model.named_parameters():
+                if not any(tp in n for tp in trainable_params):
+                    p.requires_grad = False
+                    frozen_count += 1
+            if is_main_process(args):
+                logger.info(f"Frozen {frozen_count} parameters (freeze_lm=True)")
+        
         no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
             {
@@ -446,16 +459,6 @@ def main():
             num_warmup_steps=int(args.max_train_steps * args.warmup_proportion),
             num_training_steps=args.max_train_steps
         )
-        
-        # 冻结LM参数
-        if args.freeze_lm:
-            trainable_params = ["prompt_embeddings", "prompt_lstm", "prompt_linear",
-                               "detector_head", "candidate_head", "gated_fusion"]
-            for n, p in model.named_parameters():
-                if not any(tp in n for tp in trainable_params):
-                    p.requires_grad = False
-                    if is_main_process(args):
-                        logger.info(f"Freeze: {n}")
         
         # 混合精度
         scaler = None
@@ -773,7 +776,9 @@ def main():
         
         if is_main_process(args):
             logger.info("***** Running test *****")
-        logger.info(f"  Num examples = {len(test_dataset)}")
+            logger.info(f"  Num examples = {len(test_dataset)}")
+        
+        test_result = evaluate(
             model, test_dataloader, tokenizer, device, args, dgca_config,
             save_predictions=True,
             output_dir=args.output_dir
