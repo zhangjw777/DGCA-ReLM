@@ -257,30 +257,3 @@ class ConfusionSet:
         """检查candidate_id是否在token_id的候选集中"""
         candidates = self.get_candidates(token_id)
         return candidate_id in candidates
-
-
-def create_confusion_set(
-    confusion_file: str,
-    tokenizer,
-    config,
-    confusion_dir: str = None
-) -> ConfusionSet:
-    """
-    创建混淆集实例的工厂函数
-    
-    Args:
-        confusion_file: 混淆集文件路径（单文件模式）
-        tokenizer: tokenizer
-        config: DGCAConfig配置对象
-        confusion_dir: 混淆集目录（多文件模式，优先使用）
-        
-    Returns:
-        ConfusionSet实例
-    """
-    return ConfusionSet(
-        confusion_dir=confusion_dir or getattr(config, 'confusion_dir', None),
-        confusion_file=confusion_file,
-        tokenizer=tokenizer,
-        candidate_size=config.candidate_size,
-        include_original=config.include_original_char,
-    )

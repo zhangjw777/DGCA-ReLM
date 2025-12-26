@@ -27,12 +27,8 @@ from transformers import AutoTokenizer, BertForMaskedLM
 from transformers import SchedulerType, get_scheduler
 
 # 项目模块
-from utils.data_processor import EcspellProcessor
 from utils.metrics import Metrics
-from utils.dgca_data_processor import (
-    convert_examples_to_dgca_features,
-    create_dgca_dataset
-)
+from utils.dgca_data_processor import PreprocessedDataset
 from config.dgca_config import DGCAConfig
 from confusion.confusion_utils import ConfusionSet
 from model.DGCAModel import DGCAReLMWrapper
@@ -264,41 +260,22 @@ def main():
         anchor = [tokenizer.sep_token] + [t for t in args.anchor]
     
     # ============ 数据处理 ============
-    processor = EcspellProcessor()
-    
-    # 导入预处理数据集类
-    from utils.dgca_data_processor import PreprocessedDataset
-    
     if args.do_train:
-        # 优先使用预处理数据
-        if args.preprocessed_train:
-            if is_main_process(args):
-                logger.info(f"Loading preprocessed training data from {args.preprocessed_train}")
-            
-            # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
-            if args.local_rank != -1:
-                if args.local_rank == 0:
-                    train_dataset = PreprocessedDataset(args.preprocessed_train)
-                dist.barrier()  # rank 0 加载完成后，其他rank再开始
-                if args.local_rank != 0:
-                    train_dataset = PreprocessedDataset(args.preprocessed_train)
-            else:
+        if not args.preprocessed_train:
+            raise ValueError("必须指定 --preprocessed_train 参数（jsonl格式的预处理数据）")
+        
+        if is_main_process(args):
+            logger.info(f"Loading preprocessed training data from {args.preprocessed_train}")
+        
+        # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
+        if args.local_rank != -1:
+            if args.local_rank == 0:
+                train_dataset = PreprocessedDataset(args.preprocessed_train)
+            dist.barrier()  # rank 0 加载完成后，其他rank再开始
+            if args.local_rank != 0:
                 train_dataset = PreprocessedDataset(args.preprocessed_train)
         else:
-            # 原始方式：读取txt文件并处理
-            train_examples = processor.get_train_examples(args.data_dir, args.train_on)
-            train_features = convert_examples_to_dgca_features(
-                train_examples,
-                args.max_seq_length,
-                tokenizer,
-                confusion_set,
-                args.prompt_length,
-                anchor=anchor,
-                mask_rate=args.mask_rate
-            )
-            train_dataset = create_dgca_dataset(train_features)
-            if is_main_process(args):
-                logger.info(f"Loaded {len(train_examples)} training examples")
+            train_dataset = PreprocessedDataset(args.preprocessed_train)
         
         if is_main_process(args):
             logger.info(f"Training dataset size: {len(train_dataset)}")
@@ -336,31 +313,21 @@ def main():
             args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
     
     if args.do_eval:
-        # 优先使用预处理数据
-        if args.preprocessed_eval:
-            if is_main_process(args):
-                logger.info(f"Loading preprocessed eval data from {args.preprocessed_eval}")
-            
-            # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
-            if args.local_rank != -1:
-                if args.local_rank == 0:
-                    eval_dataset = PreprocessedDataset(args.preprocessed_eval)
-                dist.barrier()
-                if args.local_rank != 0:
-                    eval_dataset = PreprocessedDataset(args.preprocessed_eval)
-            else:
+        if not args.preprocessed_eval:
+            raise ValueError("必须指定 --preprocessed_eval 参数（jsonl格式的预处理数据）")
+        
+        if is_main_process(args):
+            logger.info(f"Loading preprocessed eval data from {args.preprocessed_eval}")
+        
+        # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
+        if args.local_rank != -1:
+            if args.local_rank == 0:
+                eval_dataset = PreprocessedDataset(args.preprocessed_eval)
+            dist.barrier()
+            if args.local_rank != 0:
                 eval_dataset = PreprocessedDataset(args.preprocessed_eval)
         else:
-            eval_examples = processor.get_dev_examples(args.data_dir, args.eval_on)
-            eval_features = convert_examples_to_dgca_features(
-                eval_examples,
-                args.max_seq_length,
-                tokenizer,
-                confusion_set,
-                args.prompt_length,
-                anchor=anchor
-            )
-            eval_dataset = create_dgca_dataset(eval_features)
+            eval_dataset = PreprocessedDataset(args.preprocessed_eval)
         
         eval_sampler = SequentialSampler(eval_dataset)
         eval_dataloader = DataLoader(
@@ -711,30 +678,21 @@ def main():
     # ============ 测试 ============
     if args.do_test:
         # 优先使用预处理数据
-        if args.preprocessed_test:
-            if is_main_process(args):
-                logger.info(f"Loading preprocessed test data from {args.preprocessed_test}")
-            
-            # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
-            if args.local_rank != -1:
-                if args.local_rank == 0:
-                    test_dataset = PreprocessedDataset(args.preprocessed_test)
-                dist.barrier()
-                if args.local_rank != 0:
-                    test_dataset = PreprocessedDataset(args.preprocessed_test)
-            else:
+        if not args.preprocessed_test:
+            raise ValueError("必须指定 --preprocessed_test 参数（jsonl格式的预处理数据）")
+        
+        if is_main_process(args):
+            logger.info(f"Loading preprocessed test data from {args.preprocessed_test}")
+        
+        # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
+        if args.local_rank != -1:
+            if args.local_rank == 0:
+                test_dataset = PreprocessedDataset(args.preprocessed_test)
+            dist.barrier()
+            if args.local_rank != 0:
                 test_dataset = PreprocessedDataset(args.preprocessed_test)
         else:
-            test_examples = processor.get_test_examples(args.data_dir, args.test_on)
-            test_features = convert_examples_to_dgca_features(
-                test_examples,
-                args.max_seq_length,
-                tokenizer,
-                confusion_set,
-                args.prompt_length,
-                anchor=anchor
-            )
-            test_dataset = create_dgca_dataset(test_features)
+            test_dataset = PreprocessedDataset(args.preprocessed_test)
         
         test_sampler = SequentialSampler(test_dataset)
         test_dataloader = DataLoader(
