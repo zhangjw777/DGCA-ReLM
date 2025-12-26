@@ -82,6 +82,10 @@ def dynamic_mask_token(inputs, targets, tokenizer, device, mask_mode="noerror", 
     """
     ReLM的masked-FT技术：在源句中随机遮蔽一部分非错误字符
     优化版：全部在GPU上执行，避免CPU-GPU数据传输
+    
+    Returns:
+        masked_inputs: 遮蔽后的输入
+        aux_mask: 布尔张量，标记哪些位置被辅助mask遮蔽（用于计算辅助MLM损失）
     """
     inputs = inputs.clone()
     
@@ -109,10 +113,10 @@ def dynamic_mask_token(inputs, targets, tokenizer, device, mask_mode="noerror", 
         probability_matrix.masked_fill_(inputs == targets, value=0.0)
     # else: mask_mode == "all", keep as is
     
-    masked_indices = torch.bernoulli(probability_matrix).bool()
-    inputs[masked_indices] = mask_id
+    aux_mask = torch.bernoulli(probability_matrix).bool()
+    inputs[aux_mask] = mask_id
     
-    return inputs
+    return inputs, aux_mask
 
 
 def main():
@@ -125,8 +129,8 @@ def main():
                         help="预训练模型路径")
     parser.add_argument("--cache_dir", type=str, default="../../cache/",
                         help="模型缓存目录")
-    parser.add_argument("--output_dir", type=str, default="outputs/dgca_relm/",
-                        help="输出目录")
+    parser.add_argument("--run_name", type=str, required=True,
+                        help="实验名称，用于组织输出目录和TensorBoard日志")
     parser.add_argument("--load_state_dict", type=str, default="",
                         help="加载已训练的模型权重")
     
@@ -213,9 +217,17 @@ def main():
     # 设置随机种子
     set_seed(args.seed, n_gpu)
     
-    # 创建输出目录
-    if is_main_process(args) and not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
+    # 创建目录结构（基于run_name）
+    # outputs/<run_name>/  - 模型检查点
+    # logs/<run_name>/     - TensorBoard日志
+    args.output_dir = os.path.join("outputs", args.run_name)
+    args.logging_dir = os.path.join("logs", args.run_name)
+    
+    if is_main_process(args):
+        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(args.logging_dir, exist_ok=True)
+        logger.info(f"Output directory: {args.output_dir}")
+        logger.info(f"TensorBoard log directory: {args.logging_dir}")
     
     # ============ 加载DGCA配置 ============
     if args.ablation:
@@ -422,10 +434,8 @@ def main():
         # 初始化TensorBoard（仅主进程）
         tb_writer = None
         if is_main_process(args):
-            tb_log_dir = os.path.join(args.output_dir, "tensorboard")
-            os.makedirs(tb_log_dir, exist_ok=True)
-            tb_writer = SummaryWriter(log_dir=tb_log_dir)
-            logger.info(f"TensorBoard log dir: {tb_log_dir}")
+            tb_writer = SummaryWriter(log_dir=args.logging_dir)
+            logger.info(f"TensorBoard log dir: {args.logging_dir}")
         
         if is_main_process(args):
             logger.info("***** Running training *****")
@@ -491,12 +501,21 @@ def main():
                     src_ids, attention_mask, trg_ids, trg_ref_ids, block_flag, error_labels, candidate_ids = \
                         [t.to(device) for t in batch]
                 
-                # Masked-FT
+                # Masked-FT + 辅助MLM标签
+                aux_mlm_labels = None
                 if args.mft:
-                    src_ids = dynamic_mask_token(
+                    # 保存原始src_ids用于辅助MLM损失
+                    original_src_ids = src_ids.clone()
+                    src_ids, aux_mask = dynamic_mask_token(
                         src_ids, trg_ref_ids, tokenizer, device,
                         args.mask_mode, args.mask_rate
                     )
+                    # 构建辅助MLM标签：被mask位置用original_src_ids（原字符）作为重建目标
+                    # 由于mask的是非错误字符（mask_mode=noerror），x_i == y_i，
+                    # 所以用src还是trg数值上相同，但概念上用src更清晰，
+                    # 便于后续ablation实验时避免监督目标混淆
+                    aux_mlm_labels = torch.full_like(src_ids, -100)
+                    aux_mlm_labels[aux_mask] = original_src_ids[aux_mask]
                 
                 # 处理labels（-100 ignore）
                 labels = trg_ids.clone()
@@ -513,6 +532,7 @@ def main():
                             labels=labels,
                             candidate_ids=candidate_ids,
                             error_labels=error_labels,
+                            aux_mlm_labels=aux_mlm_labels,
                             apply_prompt=args.apply_prompt
                         )
                 else:
@@ -523,6 +543,7 @@ def main():
                         labels=labels,
                         candidate_ids=candidate_ids,
                         error_labels=error_labels,
+                        aux_mlm_labels=aux_mlm_labels,
                         apply_prompt=args.apply_prompt
                     )
                 
@@ -536,6 +557,8 @@ def main():
                     accumulated_losses['detection'] += outputs['detection_loss'].item()
                 if outputs.get('rank_loss') is not None:
                     accumulated_losses['rank'] += outputs['rank_loss'].item()
+                if outputs.get('aux_mlm_loss') is not None:
+                    accumulated_losses['aux_mlm'] = accumulated_losses.get('aux_mlm', 0.0) + outputs['aux_mlm_loss'].item()
                 
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
@@ -594,6 +617,8 @@ def main():
                             tb_writer.add_scalar('train/loss_detection', accumulated_losses['detection'] / log_steps, global_step)
                         if accumulated_losses['rank'] > 0:
                             tb_writer.add_scalar('train/loss_rank', accumulated_losses['rank'] / log_steps, global_step)
+                        if accumulated_losses.get('aux_mlm', 0) > 0:
+                            tb_writer.add_scalar('train/loss_aux_mlm', accumulated_losses['aux_mlm'] / log_steps, global_step)
                         
                         # 记录学习率
                         current_lr = scheduler.get_last_lr()[0]
@@ -792,6 +817,26 @@ def evaluate(model, dataloader, tokenizer, device, args, config,
         
         # 解码预测结果
         _, prd_ids = torch.max(logits, dim=-1)
+        
+        # 推理阈值判断：只有当检测概率或门控权重超过阈值时才使用模型预测
+        # 否则保留原字符（实现"选择性改动策略"）
+        detection_probs = outputs.get('detection_probs')
+        gate_weights = outputs.get('gate_weights')
+        
+        if detection_probs is not None or gate_weights is not None:
+            # 计算是否应该修改的mask
+            should_modify = torch.zeros_like(prd_ids, dtype=torch.bool)
+            
+            if detection_probs is not None and config.detect_threshold > 0:
+                should_modify = should_modify | (detection_probs > config.detect_threshold)
+            
+            if gate_weights is not None and config.gate_threshold > 0:
+                should_modify = should_modify | (gate_weights > config.gate_threshold)
+            
+            # 如果两个阈值都为0，则不使用阈值判断（保持原行为）
+            if config.detect_threshold > 0 or config.gate_threshold > 0:
+                # 对于不应该修改的位置，保留原输入
+                prd_ids = torch.where(should_modify, prd_ids, src_ids)
         prd_ids = prd_ids.masked_fill(attention_mask == 0, 0)
         
         src_ids_list = src_ids.tolist()

@@ -303,6 +303,7 @@ class DGCAReLMWrapper(nn.Module):
         labels: torch.Tensor,
         candidate_ids: Optional[torch.Tensor] = None,
         error_labels: Optional[torch.Tensor] = None,
+        aux_mlm_labels: Optional[torch.Tensor] = None,
         apply_prompt: bool = True,
         return_dict: bool = True
     ) -> Dict[str, torch.Tensor]:
@@ -314,6 +315,7 @@ class DGCAReLMWrapper(nn.Module):
             labels: (batch, seq_len) 目标token ids（-100为ignore）
             candidate_ids: (batch, seq_len, cand_size) 候选集token ids
             error_labels: (batch, seq_len) 错误位置标签（1=错误，0=正确，-100=ignore）
+            aux_mlm_labels: (batch, seq_len) 辅助MLM标签（被mask位置的原始token，用于重建损失）
             apply_prompt: 是否应用prompt
             return_dict: 是否返回字典
             
@@ -462,6 +464,20 @@ class DGCAReLMWrapper(nn.Module):
                     rank_loss_all = rank_loss_all.sum(dim=-1)  # (batch, seq_len)
                     rank_loss = rank_loss_all[valid_positions].mean()
         
+        # ========== 辅助MLM损失（ReLM抵抗对齐捷径） ==========
+        aux_mlm_loss = None
+        if aux_mlm_labels is not None and self.training:
+            # 使用vocab_logits计算辅助MLM损失（不用融合后的logits）
+            # 这样辅助MLM任务直接作用于BERT backbone
+            aux_loss_fct = nn.CrossEntropyLoss(reduction='none')
+            aux_loss_all = aux_loss_fct(
+                vocab_logits.view(-1, self.vocab_size),
+                aux_mlm_labels.view(-1)
+            )
+            aux_valid_mask = (aux_mlm_labels.view(-1) != -100)
+            if aux_valid_mask.any():
+                aux_mlm_loss = aux_loss_all[aux_valid_mask].mean()
+        
         # ========== 总损失 ==========
         loss = None
         if correction_loss is not None:
@@ -472,6 +488,9 @@ class DGCAReLMWrapper(nn.Module):
             
             if rank_loss is not None:
                 loss = loss + self.config.rank_loss_weight * rank_loss
+            
+            if aux_mlm_loss is not None:
+                loss = loss + self.config.aux_mlm_loss_weight * aux_mlm_loss
         
         # 返回结果
         if not return_dict:
@@ -485,4 +504,5 @@ class DGCAReLMWrapper(nn.Module):
             'correction_loss': correction_loss,
             'detection_loss': detection_loss,
             'rank_loss': rank_loss,
+            'aux_mlm_loss': aux_mlm_loss,
         }

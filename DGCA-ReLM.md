@@ -191,7 +191,7 @@ $$\mathcal{L}_{det}=-\sum_i \Big(\beta \cdot e_i\log d_i + (1-e_i)\log(1-d_i)\Bi
 
 mask rate 可采用课程策略：0.1→0.2→0.3，参考原文 30% 最优结论。
 
-## 5.4 候选排序/对比损失 $\mathcal{L}_{rank}$（可选但很“加分”）
+## 5.4 候选排序/对比损失 $\mathcal{L}_{rank}$（可选）
 
 在候选集内做 margin ranking：
 

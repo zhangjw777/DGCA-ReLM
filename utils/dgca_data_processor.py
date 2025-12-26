@@ -30,17 +30,24 @@ def generate_error_labels(
     tokenizer
 ) -> List[int]:
     """
-    生成错误位置标签
+    生成错误位置标签（用于检测分支 DetectorHead 训练）
+    
+    设计原则：
+    检测器应从源句侧预测哪些位置有错误，因此 error_labels 在源句部分生成 0/1 标签。
     
     策略：
-    1. prompt位置、padding位置：-100（ignore）
-    2. 源句部分（SEP之前）：比较src和trg_ref，不同为1
-    3. 目标句部分（SEP之后的mask）：比较trg_ref和trg，不同为1
+    1. prompt位置（CLS/SEP）、padding位置：-100（ignore）
+    2. 源句部分（SEP之前的实际字符）：比较 src 和 trg_ref（正确答案），不同为1，相同为0
+    3. 目标句部分（SEP之后的Mask区域）：-100（ignore，纠错由CandidateHead负责）
+    
+    数据对齐说明：
+    - trg_ref_ids 的前半部分（源句区域）存储的是 trg（正确答案）
+    - trg_ref_ids 的后半部分（目标区域）存储的是 src（原始错误句）
     
     Args:
-        src_ids: 源句token ids（含prompt和mask）
-        trg_ids: 目标句token ids（含prompt和正确答案）
-        trg_ref_ids: 参考（用于判断原始是否有错）
+        src_ids: 源句token ids（含prompt和mask），格式: [CLS]*P + src + [SEP]*P + [MASK]*n
+        trg_ids: 目标句token ids（含prompt和正确答案），格式: [CLS]*P + src + [SEP]*P + trg
+        trg_ref_ids: 参考ids，格式: [CLS]*P + trg + [SEP]*P + src
         tokenizer: tokenizer
         
     Returns:
@@ -65,22 +72,20 @@ def generate_error_labels(
             error_labels.append(-100)  # SEP本身ignore
             continue
         
-        # 源句部分（SEP之前）
+        # 源句部分（SEP之前）—— 检测器在此预测
         if not passed_sep:
-            # 源句部分不需要预测，但可以用于检测
-            # 这里标记为-100，因为不参与纠错训练
-            error_labels.append(-100)
-        else:
-            # 目标句部分（mask位置）
-            if s == mask_token_id:
-                # 这是需要预测的位置
-                # 判断是否有错：trg_ref对应位置 vs trg对应位置
-                if r != t:
-                    error_labels.append(1)  # 有错
-                else:
-                    error_labels.append(0)  # 无错
-            else:
+            # CLS token 跳过
+            if s == tokenizer.cls_token_id:
                 error_labels.append(-100)
+            else:
+                # 在源句位置，比较 src(s) 和 trg_ref(r)（正确答案）
+                # 若 s != r，说明该位置有错，标记为1；否则为0
+                is_error = 1 if s != r else 0
+                error_labels.append(is_error)
+        else:
+            # 目标句部分（Mask区域）—— 检测器不需要预测，设为-100
+            # 纠错任务由 CandidateHead 在此区域完成
+            error_labels.append(-100)
     
     return error_labels
 
@@ -113,8 +118,10 @@ def convert_examples_to_prompts(
                      [tokenizer.sep_token] * prompt_length + trg
         block_flag = [1] * prompt_length + [0 for _ in src] + [0 for _ in anchor] + \
                      [1] * prompt_length + [0 for _ in trg]
-        # trg_ref后半段是src，用于判断哪些位置有错
-        trg_ref = [tokenizer.cls_token] * prompt_length + src + anchor + \
+        # trg_ref 设计：
+        # - 前半部分（源句区域）：trg（正确答案），用于检测器判断源句哪些位置有错
+        # - 后半部分（目标区域）：src（原始错误句），用于纠错损失判断哪些mask位置需要修正
+        trg_ref = [tokenizer.cls_token] * prompt_length + trg + anchor + \
                   [tokenizer.sep_token] * prompt_length + src
     else:
         prompt_src = [tokenizer.cls_token] * prompt_length + src + \
@@ -123,8 +130,10 @@ def convert_examples_to_prompts(
                      [tokenizer.sep_token] * prompt_length + trg
         block_flag = [1] * prompt_length + [0 for _ in src] + \
                      [1] * prompt_length + [0 for _ in trg]
-        # trg_ref后半段是src，用于判断哪些位置有错
-        trg_ref = [tokenizer.cls_token] * prompt_length + src + \
+        # trg_ref 设计：
+        # - 前半部分（源句区域）：trg（正确答案），用于检测器判断源句哪些位置有错
+        # - 后半部分（目标区域）：src（原始错误句），用于纠错损失判断哪些mask位置需要修正
+        trg_ref = [tokenizer.cls_token] * prompt_length + trg + \
                   [tokenizer.sep_token] * prompt_length + src
     
     return prompt_src, prompt_trg, block_flag, trg_ref
