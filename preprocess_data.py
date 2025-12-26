@@ -26,7 +26,6 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from transformers import AutoTokenizer
-from datasets import Dataset
 from confusion.confusion_utils import ConfusionSet
 from config.dgca_config import DGCAConfig
 
@@ -262,25 +261,25 @@ def preprocess_and_save_jsonl(
     prompt_length: int,
     output_path: str
 ):
-    """预处理数据并保存为jsonl格式"""
-    results = []
+    """预处理数据并保存为jsonl格式（流式写入，避免OOM）"""
+    count = 0
     
-    for src, trg in tqdm(pairs, desc=f"处理 {os.path.basename(output_path)}"):
-        try:
-            sample = process_sample(
-                src, trg, tokenizer, confusion_set, max_seq_length, prompt_length
-            )
-            if sample is not None:
-                results.append(sample)
-        except Exception as e:
-            continue
+    # 流式写入，边处理边写文件，避免内存爆炸
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for src, trg in tqdm(pairs, desc=f"处理 {os.path.basename(output_path)}"):
+            try:
+                sample = process_sample(
+                    src, trg, tokenizer, confusion_set, max_seq_length, prompt_length
+                )
+                if sample is not None:
+                    # 直接写入jsonl，每行一个json对象
+                    f.write(json.dumps(sample, ensure_ascii=False) + '\n')
+                    count += 1
+            except Exception as e:
+                continue
     
-    # 使用datasets库保存为jsonl
-    ds = Dataset.from_list(results)
-    ds.to_json(output_path, orient='records', lines=True)
-    
-    print(f"保存: {output_path}, 样本数: {len(results)}")
-    return len(results)
+    print(f"保存: {output_path}, 样本数: {count}")
+    return count
 
 
 def main():

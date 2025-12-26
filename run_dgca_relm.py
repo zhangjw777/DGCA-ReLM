@@ -35,7 +35,7 @@ from utils.dgca_data_processor import (
 )
 from config.dgca_config import DGCAConfig
 from confusion.confusion_utils import ConfusionSet
-from multiTask.DGCAModel import DGCAReLMWrapper
+from model.DGCAModel import DGCAReLMWrapper
 
 
 logging.basicConfig(
@@ -189,8 +189,6 @@ def main():
     parser.add_argument("--fp16", action="store_true", help="是否使用混合精度")
     parser.add_argument("--local_rank", type=int, default=-1, help="DDP local rank")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader的工作进程数")
-    parser.add_argument("--preload_data", action="store_true", 
-                        help="预加载数据到内存（需要足够RAM，但可显著提升速度）")
     parser.add_argument("--prefetch_factor", type=int, default=2,
                         help="DataLoader预取因子，每个worker预取的batch数量")
     
@@ -276,27 +274,16 @@ def main():
         if args.preprocessed_train:
             if is_main_process(args):
                 logger.info(f"Loading preprocessed training data from {args.preprocessed_train}")
-                if args.preload_data:
-                    logger.info("Preloading data to memory (this may take a while for large datasets)...")
             
             # DDP模式下，让rank 0先加载，其他rank等待，避免I/O竞争
             if args.local_rank != -1:
                 if args.local_rank == 0:
-                    train_dataset = PreprocessedDataset(
-                        args.preprocessed_train, 
-                        preload_to_memory=args.preload_data
-                    )
+                    train_dataset = PreprocessedDataset(args.preprocessed_train)
                 dist.barrier()  # rank 0 加载完成后，其他rank再开始
                 if args.local_rank != 0:
-                    train_dataset = PreprocessedDataset(
-                        args.preprocessed_train,
-                        preload_to_memory=args.preload_data
-                    )
+                    train_dataset = PreprocessedDataset(args.preprocessed_train)
             else:
-                train_dataset = PreprocessedDataset(
-                    args.preprocessed_train,
-                    preload_to_memory=args.preload_data
-                )
+                train_dataset = PreprocessedDataset(args.preprocessed_train)
         else:
             # 原始方式：读取txt文件并处理
             train_examples = processor.get_train_examples(args.data_dir, args.train_on)
