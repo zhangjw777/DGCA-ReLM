@@ -140,9 +140,6 @@ def main():
     parser.add_argument("--do_train", action="store_true", help="是否训练")
     parser.add_argument("--do_eval", action="store_true", help="是否验证")
     parser.add_argument("--do_test", action="store_true", help="是否测试")
-    parser.add_argument("--train_on", type=str, default="law", help="训练集划分：law/med/odw")
-    parser.add_argument("--eval_on", type=str, default="law")
-    parser.add_argument("--test_on", type=str, default="law")
     
     # ============ 预处理数据（可选，加速训练） ============
     parser.add_argument("--preprocessed_train", type=str, default=None)
@@ -608,63 +605,77 @@ def main():
                 # 验证和保存
                 # 使用eval_steps控制评估频率，默认与save_steps相同
                 eval_step_interval = args.eval_steps if args.eval_steps else args.save_steps
-                if args.do_eval and global_step % eval_step_interval == 0 and is_main_process(args):
+                if args.do_eval and global_step % eval_step_interval == 0:
+                    # 所有进程都参与评估（保持模型状态同步）
+                    # 但只有主进程记录日志和保存模型
                     eval_result = evaluate(
                         model, eval_dataloader, tokenizer, device, args, dgca_config
                     )
                     
-                    logger.info(f"***** Eval results at step {global_step} *****")
-                    for key, value in eval_result.items():
-                        logger.info(f"  {key} = {value:.4f}")
+                    if is_main_process(args):
+                        logger.info(f"***** Eval results at step {global_step} *****")
+                        for key, value in eval_result.items():
+                            logger.info(f"  {key} = {value:.4f}")
+                        
+                        # TensorBoard记录验证指标
+                        if tb_writer is not None:
+                            tb_writer.add_scalar('eval/loss', eval_result['loss'], global_step)
+                            tb_writer.add_scalar('eval/precision', eval_result['precision'], global_step)
+                            tb_writer.add_scalar('eval/recall', eval_result['recall'], global_step)
+                            tb_writer.add_scalar('eval/f1', eval_result['f1'], global_step)
+                            tb_writer.add_scalar('eval/f2', eval_result['f2'], global_step)
+                            tb_writer.add_scalar('eval/fpr', eval_result['fpr'], global_step)
+                            tb_writer.add_scalar('eval/wpr', eval_result['wpr'], global_step)
+                        
+                        # 保存模型
+                        model_to_save = model.module if hasattr(model, "module") else model
+                        output_file = os.path.join(
+                            args.output_dir,
+                            f"step-{global_step}_f1-{eval_result['f1']:.2f}.bin"
+                        )
+                        torch.save(model_to_save.state_dict(), output_file)
+                        
+                        best_result.append((eval_result['f1'], output_file))
+                        best_result.sort(key=lambda x: x[0], reverse=True)
+                        
+                        # 只保留前3个最佳模型
+                        if len(best_result) > 3:
+                            _, model_to_remove = best_result.pop()
+                            if os.path.exists(model_to_remove):
+                                os.remove(model_to_remove)
+                        
+                        # 保存评估结果
+                        with open(os.path.join(args.output_dir, "eval_results.txt"), "a") as f:
+                            f.write(f"Step {global_step}: P={eval_result['precision']:.2f}, "
+                                   f"R={eval_result['recall']:.2f}, F1={eval_result['f1']:.2f}, "
+                                   f"F2={eval_result['f2']:.2f}, FPR={eval_result['fpr']:.2f}\n")
+                        
+                        # Early Stopping 判断
+                        if args.early_stopping_patience is not None:
+                            current_metric = eval_result[args.early_stopping_metric]
+                            if current_metric > best_metric:
+                                best_metric = current_metric
+                                patience_counter = 0
+                                logger.info(f"New best {args.early_stopping_metric}: {best_metric:.4f}")
+                            else:
+                                patience_counter += 1
+                                logger.info(f"Early stopping patience: {patience_counter}/{args.early_stopping_patience}")
+                                
+                                if patience_counter >= args.early_stopping_patience:
+                                    logger.info(f"Early stopping triggered! Best {args.early_stopping_metric}: {best_metric:.4f}")
+                                    wrap = True
                     
-                    # TensorBoard记录验证指标
-                    if tb_writer is not None:
-                        tb_writer.add_scalar('eval/loss', eval_result['loss'], global_step)
-                        tb_writer.add_scalar('eval/precision', eval_result['precision'], global_step)
-                        tb_writer.add_scalar('eval/recall', eval_result['recall'], global_step)
-                        tb_writer.add_scalar('eval/f1', eval_result['f1'], global_step)
-                        tb_writer.add_scalar('eval/f2', eval_result['f2'], global_step)
-                        tb_writer.add_scalar('eval/fpr', eval_result['fpr'], global_step)
-                        tb_writer.add_scalar('eval/wpr', eval_result['wpr'], global_step)
+                    # DDP同步：所有进程等待主进程完成评估和保存
+                    # 同时广播 early stopping 状态
+                    if args.local_rank != -1:
+                        # 广播 wrap 状态到所有进程
+                        wrap_tensor = torch.tensor([1 if wrap else 0], device=device)
+                        dist.broadcast(wrap_tensor, src=0)
+                        wrap = wrap_tensor.item() == 1
+                        dist.barrier()
                     
-                    # 保存模型
-                    model_to_save = model.module if hasattr(model, "module") else model
-                    output_file = os.path.join(
-                        args.output_dir,
-                        f"step-{global_step}_f1-{eval_result['f1']:.2f}.bin"
-                    )
-                    torch.save(model_to_save.state_dict(), output_file)
-                    
-                    best_result.append((eval_result['f1'], output_file))
-                    best_result.sort(key=lambda x: x[0], reverse=True)
-                    
-                    # 只保留前3个最佳模型
-                    if len(best_result) > 3:
-                        _, model_to_remove = best_result.pop()
-                        if os.path.exists(model_to_remove):
-                            os.remove(model_to_remove)
-                    
-                    # 保存评估结果
-                    with open(os.path.join(args.output_dir, "eval_results.txt"), "a") as f:
-                        f.write(f"Step {global_step}: P={eval_result['precision']:.2f}, "
-                               f"R={eval_result['recall']:.2f}, F1={eval_result['f1']:.2f}, "
-                               f"F2={eval_result['f2']:.2f}, FPR={eval_result['fpr']:.2f}\n")
-                    
-                    # Early Stopping 判断
-                    if args.early_stopping_patience is not None:
-                        current_metric = eval_result[args.early_stopping_metric]
-                        if current_metric > best_metric:
-                            best_metric = current_metric
-                            patience_counter = 0
-                            logger.info(f"New best {args.early_stopping_metric}: {best_metric:.4f}")
-                        else:
-                            patience_counter += 1
-                            logger.info(f"Early stopping patience: {patience_counter}/{args.early_stopping_patience}")
-                            
-                            if patience_counter >= args.early_stopping_patience:
-                                logger.info(f"Early stopping triggered! Best {args.early_stopping_metric}: {best_metric:.4f}")
-                                wrap = True
-                                break
+                    if wrap:
+                        break
                 
                 if global_step >= args.max_train_steps:
                     wrap = True
