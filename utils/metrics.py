@@ -52,13 +52,13 @@ class Metrics:
                 prd_pos_sents.append(difference(s, p))
             if s == p:
                 prd_neg_sents.append(difference(s, p))
-        if len(pos_sents)==0:
-            p=0
-            r=0
-            f1=0
-            wpr=0
+        if len(pos_sents) == 0:
+            p = 0
+            r = 0
+            f1 = 0
+            wpr = 0
         else:
-            p = 1.0 * len(tp_sents) / len(prd_pos_sents)
+            p = 0 if len(prd_pos_sents) == 0 else 1.0 * len(tp_sents) / len(prd_pos_sents)
             r = 1.0 * len(tp_sents) / len(pos_sents)
             f1 = 2.0 * (p * r) / (p + r + 1e-12)
             wpr = 1.0 * len(wp_sents) / len(pos_sents)
