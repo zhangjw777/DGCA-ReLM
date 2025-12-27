@@ -532,6 +532,7 @@ def main():
                             labels=labels,
                             candidate_ids=candidate_ids,
                             error_labels=error_labels,
+                            trg_ref_ids=trg_ref_ids,
                             aux_mlm_labels=aux_mlm_labels,
                             apply_prompt=args.apply_prompt
                         )
@@ -543,6 +544,7 @@ def main():
                         labels=labels,
                         candidate_ids=candidate_ids,
                         error_labels=error_labels,
+                        trg_ref_ids=trg_ref_ids,
                         aux_mlm_labels=aux_mlm_labels,
                         apply_prompt=args.apply_prompt
                     )
@@ -808,6 +810,7 @@ def evaluate(model, dataloader, tokenizer, device, args, config,
                 labels=labels,
                 candidate_ids=candidate_ids,
                 error_labels=error_labels,
+                trg_ref_ids=trg_ref_ids,
                 apply_prompt=args.apply_prompt
             )
             
@@ -820,6 +823,8 @@ def evaluate(model, dataloader, tokenizer, device, args, config,
         
         # 推理阈值判断：只有当检测概率或门控权重超过阈值时才使用模型预测
         # 否则保留原字符（实现"选择性改动策略"）
+        # 【关键修复】使用 trg_ref_ids 获取原字符（目标侧存储了原始src字符）
+        # 而不是 src_ids（目标侧是 MASK token）
         detection_probs = outputs.get('detection_probs')
         gate_weights = outputs.get('gate_weights')
         
@@ -835,8 +840,10 @@ def evaluate(model, dataloader, tokenizer, device, args, config,
             
             # 如果两个阈值都为0，则不使用阈值判断（保持原行为）
             if config.detect_threshold > 0 or config.gate_threshold > 0:
-                # 对于不应该修改的位置，保留原输入
-                prd_ids = torch.where(should_modify, prd_ids, src_ids)
+                # 修复：使用 trg_ref_ids 保留原字符
+                # trg_ref_ids 格式: [CLS]*P + trg + [SEP]*P + src
+                # 目标侧（SEP后）存储的是原始src字符，这才是"保留原字"的正确来源
+                prd_ids = torch.where(should_modify, prd_ids, trg_ref_ids)
         prd_ids = prd_ids.masked_fill(attention_mask == 0, 0)
         
         src_ids_list = src_ids.tolist()

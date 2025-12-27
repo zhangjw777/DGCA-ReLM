@@ -303,6 +303,7 @@ class DGCAReLMWrapper(nn.Module):
         labels: torch.Tensor,
         candidate_ids: Optional[torch.Tensor] = None,
         error_labels: Optional[torch.Tensor] = None,
+        trg_ref_ids: Optional[torch.Tensor] = None,
         aux_mlm_labels: Optional[torch.Tensor] = None,
         apply_prompt: bool = True,
         return_dict: bool = True
@@ -314,13 +315,15 @@ class DGCAReLMWrapper(nn.Module):
             prompt_mask: (batch, seq_len) prompt位置标记
             labels: (batch, seq_len) 目标token ids（-100为ignore）
             candidate_ids: (batch, seq_len, cand_size) 候选集token ids
-            error_labels: (batch, seq_len) 错误位置标签（1=错误，0=正确，-100=ignore）
+            error_labels: (batch, seq_len) 错误位置标签（1=错误，0=正确，-100=ignore），用于检测损失
+            trg_ref_ids: (batch, seq_len) 参考ids，格式: [CLS]*P + trg + [SEP]*P + src
+                         目标侧存储原始src字符，用于：1) 纠错位加权 2) 推理时保留原字
             aux_mlm_labels: (batch, seq_len) 辅助MLM标签（被mask位置的原始token，用于重建损失）
             apply_prompt: 是否应用prompt
             return_dict: 是否返回字典
             
         Returns:
-            字典包含: loss, logits, detection_probs, gate_weights等
+            字典包含: loss, logits, detection_probs, gate_weights, trg_ref_ids等
         """
         batch_size, seq_len = input_ids.shape
         
@@ -428,9 +431,14 @@ class DGCAReLMWrapper(nn.Module):
             )  # (batch * seq_len,)
             
             # 错误位置加权
-            if self.config.error_position_weight > 0 and error_labels is not None:
+            # 修复：使用trg_ref_ids来判断目标侧哪些位置是错误位（需要更高权重）
+            # trg_ref_ids格式: [CLS]*P + trg + [SEP]*P + src
+            # 目标侧（SEP后）存储的是原始src，与labels（目标trg）比较可判断错误位
+            if self.config.error_position_weight > 0 and trg_ref_ids is not None:
                 weight = torch.ones_like(labels, dtype=torch.float)
-                weight[error_labels == 1] = 1 + self.config.error_position_weight
+                # 错误位：trg_ref_ids != labels 且 labels != -100（有效位置）
+                error_positions = (trg_ref_ids != labels) & (labels != -100)
+                weight[error_positions] = 1 + self.config.error_position_weight
                 weight = weight.view(-1)
                 correction_loss_all = correction_loss_all * weight
             
