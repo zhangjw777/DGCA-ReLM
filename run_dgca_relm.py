@@ -777,8 +777,15 @@ def main():
 
 
 def evaluate(model, dataloader, tokenizer, device, args, config,
-             save_predictions=False, output_dir=None):
-    """评估函数"""
+             save_predictions=False, output_dir=None, use_threshold=False):
+    """
+    评估函数
+    
+    Args:
+        use_threshold: 是否使用阈值过滤（默认False）
+                      - False: 训练/评估阶段，直接使用模型预测，不做阈值过滤
+                      - True: 推理部署阶段，使用检测和门控阈值过滤（选择性修改）
+    """
     model.eval()
     
     all_inputs, all_labels, all_predictions = [], [], []
@@ -821,29 +828,25 @@ def evaluate(model, dataloader, tokenizer, device, args, config,
         # 解码预测结果
         _, prd_ids = torch.max(logits, dim=-1)
         
-        # 推理阈值判断：只有当检测概率或门控权重超过阈值时才使用模型预测
-        # 否则保留原字符（实现"选择性改动策略"）
-        # 【关键修复】使用 trg_ref_ids 获取原字符（目标侧存储了原始src字符）
-        # 而不是 src_ids（目标侧是 MASK token）
-        detection_probs = outputs.get('detection_probs')
-        gate_weights = outputs.get('gate_weights')
+        # 阈值过滤机制（仅在推理阶段使用）
+        if use_threshold:
+            detection_probs = outputs.get('detection_probs')
+            gate_weights = outputs.get('gate_weights')
+            
+            if detection_probs is not None or gate_weights is not None:
+                should_modify = torch.zeros_like(prd_ids, dtype=torch.bool)
+                
+                if detection_probs is not None and config.detect_threshold > 0:
+                    should_modify = should_modify | (detection_probs > config.detect_threshold)
+                
+                if gate_weights is not None and config.gate_threshold > 0:
+                    should_modify = should_modify | (gate_weights > config.gate_threshold)
+                
+                if config.detect_threshold > 0 or config.gate_threshold > 0:
+                    # 使用 trg_ref_ids 保留原字符
+                    # trg_ref_ids 格式: [CLS]*P + trg + [SEP]*P + src
+                    prd_ids = torch.where(should_modify, prd_ids, trg_ref_ids)
         
-        if detection_probs is not None or gate_weights is not None:
-            # 计算是否应该修改的mask
-            should_modify = torch.zeros_like(prd_ids, dtype=torch.bool)
-            
-            if detection_probs is not None and config.detect_threshold > 0:
-                should_modify = should_modify | (detection_probs > config.detect_threshold)
-            
-            if gate_weights is not None and config.gate_threshold > 0:
-                should_modify = should_modify | (gate_weights > config.gate_threshold)
-            
-            # 如果两个阈值都为0，则不使用阈值判断（保持原行为）
-            if config.detect_threshold > 0 or config.gate_threshold > 0:
-                # 修复：使用 trg_ref_ids 保留原字符
-                # trg_ref_ids 格式: [CLS]*P + trg + [SEP]*P + src
-                # 目标侧（SEP后）存储的是原始src字符，这才是"保留原字"的正确来源
-                prd_ids = torch.where(should_modify, prd_ids, trg_ref_ids)
         prd_ids = prd_ids.masked_fill(attention_mask == 0, 0)
         
         src_ids_list = src_ids.tolist()

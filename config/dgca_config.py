@@ -62,8 +62,10 @@ class DGCAConfig:
     
     # ============ 推理相关 ============
     # 检测阈值（d_i > τ 才考虑修改）
+    # 注意：训练/评估时不使用阈值，仅在推理部署时启用
     detect_threshold: float = 0.5
     # 门控阈值（α_i > τ 才使用候选头）
+    # 注意：训练/评估时不使用阈值，仅在推理部署时启用
     gate_threshold: float = 0.3
     # 是否使用两次迭代修正
     use_iterative_refinement: bool = False
